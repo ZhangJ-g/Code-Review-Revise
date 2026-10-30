@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+            {
+        "name": "Debug Current Test",
+        "type": "debugpy",
+        "request": "launch",
+        "python": "${workspaceFolder}/.venv/bin/python",
+        "program": "${file}",
+        "cwd": "${workspaceFolder}",
+        "console": "integratedTerminal"
+        }
+    ]
+}
