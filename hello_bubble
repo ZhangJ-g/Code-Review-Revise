@@ -1,0 +1,36 @@
+def heap_sort(values):
+    """使用堆排序返回升序新列表，不修改传入的数据。
+
+    时间复杂度为 O(n log n)，堆调整使用 O(1) 额外空间；
+    为保留原始数据，复制列表使用 O(n) 空间。此排序不稳定。
+    """
+    items = list(values)
+    n = len(items)
+
+    def sift_down(root, end):
+        # end 为堆的右侧开区间边界。
+        while 2 * root + 1 < end:
+            child = 2 * root + 1
+            if child + 1 < end and items[child] < items[child + 1]:
+                child += 1
+            if not items[root] < items[child]:
+                break
+            items[root], items[child] = items[child], items[root]
+            root = child
+
+    # 从最后一个非叶节点开始，建立最大堆。
+    for root in range(n // 2 - 1, -1, -1):
+        sift_down(root, n)
+
+    # 将堆顶最大值依次移到末尾，并恢复剩余部分的堆结构。
+    for end in range(n - 1, 0, -1):
+        items[0], items[end] = items[end], items[0]
+        sift_down(0, end)
+
+    return items
+
+
+if __name__ == "__main__":
+    numbers = [64, 34, 25, 12, 22, 11, 90]
+    print("原始数据：", numbers)
+    print("排序结果：", heap_sort(numbers))

@@ -92,6 +92,11 @@ class Agent:
             tool_call_id=call.id,
         ))
 
+    @staticmethod
+    def validate_resume(history: History, *, parent_id: str | None = None) -> None:
+        """供入口在选择分支时检查；不改叶节点，不执行工具。"""
+        Agent._check_resumable(history.path(parent_id))
+
     def run(
         self,
         task: str,
@@ -109,9 +114,8 @@ class Agent:
             if parent_id is not None:
                 raise ValueError("创建分支需要传入已有 history")
             history = History.create(build_system_message(self.registry))
-        self._check_resumable(history.path(parent_id))
+        self.validate_resume(history, parent_id=parent_id)
         self.history_tree = history
-        print(history.nodes[history.conversation.root_id].message)
         history.append(Message(Role.USER, content=task), parent_id=parent_id)
         self.store.save(history)
         for round_number in range(1, self.max_rounds + 1):

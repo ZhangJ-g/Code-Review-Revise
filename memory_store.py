@@ -8,7 +8,7 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-from history import History, require_timestamp
+from history import History, excerpt, require_timestamp
 from models import Conversation, Message, Role, Session, ToolCall
 
 
@@ -80,7 +80,13 @@ def history_from_dict(data: dict) -> History:
             node["created_at"] = _time_from_json(node["created_at"])
             node["message"] = _message_from_json(node["message"])
             nodes.append(Session(**node))
-        return History(conversation, nodes)
+        history = History(conversation, nodes)
+        # 旧文件没有 title 时从首条用户消息恢复展示标题，不在读取时改写文件。
+        if not history.conversation.title.strip():
+            users = [node for node in nodes if node.message.role == Role.USER]
+            first_user = min(users, key=lambda node: (node.created_at, node.id)) if users else None
+            history.conversation.title = excerpt(first_user.message.content) if first_user else "未命名对话"
+        return history
     except (KeyError, TypeError, AttributeError):
         raise ValueError("历史 JSON 缺少必要字段或字段类型错误") from None
 
@@ -109,6 +115,22 @@ class JsonMemoryStore:
         if not isinstance(conversation_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", conversation_id):
             raise ValueError("对话文件 ID 只能包含字母、数字、下划线或连字符，最长 128 字符")
         return self.directory / f"{conversation_id}.json"
+
+    def list_conversations(self) -> tuple[list[Conversation], list[str]]:
+        """小规模本地存储直接加载校验，损坏文件单独提示，不影响其他对话。"""
+        conversations = []
+        notices = []
+        for path in sorted(self.directory.glob("*.json")):
+            if not path.is_file():
+                continue
+            try:
+                history = self.load(path.stem)
+            except (ValueError, OSError):
+                notices.append(f"已跳过无法读取或校验失败的文件：{path.name}")
+                continue
+            conversations.append(history.conversation)
+        conversations.sort(key=lambda item: (item.updated_at, item.id), reverse=True)
+        return conversations, notices
 
     def save(self, history: History) -> Path:
         target = self.path_for(history.conversation.id)

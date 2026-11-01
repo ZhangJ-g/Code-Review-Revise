@@ -77,3 +77,4 @@ class Conversation:#记录整棵对话树的元数据
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    title: str = ""

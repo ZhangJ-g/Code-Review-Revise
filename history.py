@@ -1,8 +1,23 @@
 """历史树的结构校验、分支操作及当前上下文路径。"""
 
 from datetime import datetime, timezone
+from dataclasses import dataclass
 
-from models import Conversation, Message, Session
+from models import Conversation, Message, Role, Session
+
+
+def excerpt(text: str, limit: int = 40) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+@dataclass(frozen=True)
+class BranchInfo:
+    leaf_id: str
+    last_user_message: str
+    last_assistant_message: str
+    last_message_at: datetime
+    is_current: bool
 
 
 def require_id(value: str) -> None:
@@ -34,6 +49,8 @@ class History:
 
     def validate(self) -> None:
         metadata = self.conversation
+        if not isinstance(metadata.title, str):
+            raise ValueError("对话标题必须是字符串")
         for value in (metadata.id, metadata.root_id, metadata.current_leaf_id):
             require_id(value)
         require_timestamp(metadata.created_at)
@@ -97,6 +114,8 @@ class History:
             raise ValueError("新节点 ID 与已有节点重复")
         self.nodes[parent_id].children_ids.append(entry.id)
         self.nodes[entry.id] = entry
+        if message.role == Role.USER and not self.conversation.title.strip():
+            self.conversation.title = excerpt(message.content) or "未命名对话"
         self.conversation.current_leaf_id = entry.id
         self.conversation.updated_at = datetime.now(timezone.utc)
         return entry
@@ -121,3 +140,27 @@ class History:
             entries.append(entry)
             node_id = entry.parent_id
         return list(reversed(entries))
+
+    def branches(self) -> list[BranchInfo]:
+        """每个叶节点对应一个候选分支，描述来自该叶节点自己的祖先链。"""
+        self.validate()
+        branches = []
+        for node in self.nodes.values():
+            if node.children_ids:
+                continue
+            messages = [entry.message for entry in self.path(node.id)]
+            user = next((message for message in reversed(messages) if message.role == Role.USER), None)
+            assistant = next((message for message in reversed(messages) if message.role == Role.ASSISTANT), None)
+            assistant_text = ""
+            if assistant is not None:
+                assistant_text = assistant.content
+                if not assistant_text.strip() and assistant.tool_calls:
+                    assistant_text = "[工具调用：" + ", ".join(call.name for call in assistant.tool_calls) + "]"
+            branches.append(BranchInfo(
+                leaf_id=node.id,
+                last_user_message=user.content if user is not None else "",
+                last_assistant_message=assistant_text,
+                last_message_at=node.created_at,
+                is_current=node.id == self.conversation.current_leaf_id,
+            ))
+        return sorted(branches, key=lambda branch: (branch.last_message_at, branch.leaf_id), reverse=True)
