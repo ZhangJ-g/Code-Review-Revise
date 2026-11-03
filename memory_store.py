@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from history import History, excerpt, require_timestamp
-from models import Conversation, Message, Role, Session, ToolCall
+from models import Conversation, Message, Role, Session, TaskRun, ToolCall
 
 
 def _time_from_json(value: str) -> datetime:
@@ -55,7 +55,13 @@ def history_to_dict(history: History) -> dict:
         # 保存前同样检查消息字段，避免写入无法重新加载的文件。
         _message_from_json(data["message"])
         nodes.append(data)
-    return {"schema_version": 1, "conversation": metadata, "nodes": nodes}
+    tasks = []
+    for task in history.tasks.values():
+        data = asdict(task)
+        for key in ("created_at", "updated_at", "finished_at"):
+            data[key] = data[key].isoformat() if data[key] is not None else None
+        tasks.append(data)
+    return {"schema_version": 1, "conversation": metadata, "nodes": nodes, "tasks": tasks}
 
 
 def history_from_dict(data: dict) -> History:
@@ -80,7 +86,22 @@ def history_from_dict(data: dict) -> History:
             node["created_at"] = _time_from_json(node["created_at"])
             node["message"] = _message_from_json(node["message"])
             nodes.append(Session(**node))
-        history = History(conversation, nodes)
+        raw_tasks = data.get("tasks", [])
+        if not isinstance(raw_tasks, list):
+            raise ValueError("tasks 必须是列表")
+        tasks = []
+        for raw_task in raw_tasks:
+            task = dict(raw_task)
+            for key in ("id", "user_node_id", "checkpoint_node_id", "status", "phase", "active_tool_call_id",
+                        "rounds", "error", "created_at", "updated_at", "finished_at"):
+                if key not in task:
+                    raise ValueError("任务检查点缺少必要字段")
+            for key in ("created_at", "updated_at"):
+                task[key] = _time_from_json(task[key])
+            if task["finished_at"] is not None:
+                task["finished_at"] = _time_from_json(task["finished_at"])
+            tasks.append(TaskRun(**task))
+        history = History(conversation, nodes, tasks)
         # 旧文件没有 title 时从首条用户消息恢复展示标题，不在读取时改写文件。
         if not history.conversation.title.strip():
             users = [node for node in nodes if node.message.role == Role.USER]

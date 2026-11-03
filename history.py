@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
-from models import Conversation, Message, Role, Session
+from models import Conversation, Message, Role, Session, TaskRun
 
 
 def excerpt(text: str, limit: int = 40) -> str:
@@ -31,7 +31,7 @@ def require_timestamp(value: datetime) -> None:
 
 
 class History:
-    def __init__(self, conversation: Conversation, nodes: list[Session]) -> None:
+    def __init__(self, conversation: Conversation, nodes: list[Session], tasks: list[TaskRun] | None = None) -> None:
         self.conversation = conversation
         self.nodes: dict[str, Session] = {}
         for node in nodes:
@@ -39,6 +39,12 @@ class History:
             if node.id in self.nodes:
                 raise ValueError("历史中存在重复节点 ID")
             self.nodes[node.id] = node
+        self.tasks: dict[str, TaskRun] = {}
+        for task in tasks or []:
+            require_id(task.id)
+            if task.id in self.tasks:
+                raise ValueError("历史中存在重复任务 ID")
+            self.tasks[task.id] = task
         self.validate()
 
     @classmethod
@@ -102,6 +108,74 @@ class History:
             raise ValueError("历史包含无法从根到达的节点（可能存在孤立环）")
         if self.nodes[metadata.current_leaf_id].children_ids:
             raise ValueError("current_leaf_id 必须指向叶节点")
+        self._validate_tasks()
+
+    def _validate_tasks(self) -> None:
+        open_checkpoints = set()
+        for task_id, task in self.tasks.items():
+            for value in (task.id, task.user_node_id, task.checkpoint_node_id):
+                require_id(value)
+            if task_id != task.id:
+                raise ValueError("任务索引与任务 ID 不一致")
+            if task.status not in {"running", "interrupted", "needs_review", "completed", "cancelled", "limit"}:
+                raise ValueError("未知任务状态")
+            if task.phase not in {"waiting_model", "waiting_approval", "executing_tool", "finished"}:
+                raise ValueError("未知任务阶段")
+            if type(task.rounds) is not int or task.rounds < 0:
+                raise ValueError("任务模型轮数必须是非负整数")
+            if task.error is not None and not isinstance(task.error, str):
+                raise ValueError("任务错误必须是字符串或 null")
+            require_timestamp(task.created_at)
+            require_timestamp(task.updated_at)
+            if task.updated_at < task.created_at:
+                raise ValueError("任务更新时间早于创建时间")
+            finished = task.status in {"completed", "cancelled"}
+            if finished != (task.phase == "finished") or finished != (task.finished_at is not None):
+                raise ValueError("任务结束状态、阶段与结束时间不一致")
+            if task.finished_at is not None:
+                require_timestamp(task.finished_at)
+                if task.finished_at < task.created_at:
+                    raise ValueError("任务结束时间早于创建时间")
+            user = self.nodes.get(task.user_node_id)
+            if user is None or user.message.role != Role.USER or task.checkpoint_node_id not in self.nodes:
+                raise ValueError("任务的用户节点或检查点无效")
+            final_message = self.nodes[task.checkpoint_node_id].message
+            if task.status == "completed" and (
+                final_message.role != Role.ASSISTANT or final_message.tool_calls or not final_message.content.strip()
+            ):
+                raise ValueError("完成任务必须有已保存的助手最终回答")
+            ancestor_ids = set()
+            node_id = task.checkpoint_node_id
+            while node_id is not None:
+                ancestor_ids.add(node_id)
+                if node_id == task.user_node_id:
+                    break
+                node_id = self.nodes[node_id].parent_id
+            if task.user_node_id not in ancestor_ids:
+                raise ValueError("任务检查点不在原用户任务的后代路径上")
+            if task.status == "needs_review" and task.phase != "executing_tool":
+                raise ValueError("待核对任务必须停在工具执行阶段")
+            if task.status == "limit" and task.phase != "waiting_model":
+                raise ValueError("轮数上限检查点必须停在模型等待阶段")
+            if task.phase in {"waiting_model", "finished"}:
+                if task.active_tool_call_id is not None:
+                    raise ValueError("此任务阶段不能包含活动工具调用")
+            else:
+                require_id(task.active_tool_call_id)
+                if not any(
+                    call.id == task.active_tool_call_id
+                    for node_id in ancestor_ids for call in self.nodes[node_id].message.tool_calls
+                ):
+                    raise ValueError("任务活动工具调用不在检查点路径中")
+            if not finished:
+                if task.checkpoint_node_id in open_checkpoints:
+                    raise ValueError("同一检查点存在多个未结束任务")
+                open_checkpoints.add(task.checkpoint_node_id)
+
+    def unfinished_task(self, node_id: str | None = None) -> TaskRun | None:
+        node_id = self.conversation.current_leaf_id if node_id is None else node_id
+        return next((task for task in self.tasks.values()
+                     if task.checkpoint_node_id == node_id and task.status not in {"completed", "cancelled"}), None)
 
     def append(self, message: Message, *, parent_id: str | None = None) -> Session:
         """默认追加到当前叶节点；指定历史父节点即可创建新分支。"""

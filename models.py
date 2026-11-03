@@ -78,3 +78,20 @@ class Conversation:#记录整棵对话树的元数据
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     title: str = ""
+
+
+@dataclass
+class TaskRun:
+    """一次用户任务的执行检查点；恢复时复用 id 和原用户消息。"""
+
+    user_node_id: str
+    checkpoint_node_id: str
+    id: str = field(default_factory=new_id)
+    status: str = "running"
+    phase: str = "waiting_model"
+    active_tool_call_id: str | None = None
+    rounds: int = 0
+    error: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    finished_at: datetime | None = None

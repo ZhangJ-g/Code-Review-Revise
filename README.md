@@ -18,6 +18,9 @@ VS Code 中也可以选择“Debug 代码检查助手（项目虚拟环境）”
 普通运行时也应通过“Python: Select Interpreter”选择项目虚拟环境。
 PyCharm 中将项目及运行配置的解释器设为项目 `.venv/bin/python`，运行后在控制台选择对话并输入任务。
 
+终端入口自动启用标准库 `readline` 的行编辑，处理中文退格和光标移动；不额外保存输入历史。
+Debug 时使用集成终端，IDE 的调试控制台未必支持同样的终端编辑行为。
+
 ## 启动 Agent
 
 接口地址可填完整的 POST 地址；若只填域名或以 `/v1` 结尾的基础地址，程序会自动补成
@@ -63,7 +66,7 @@ export MODEL_AUTH_PREFIX=''
 运行配置直接在 `main.py` 的 `main()` 中修改：`root` 是文件工具根目录，
 默认为项目目录；`max_rounds = 10` 控制最大模型调用次数，
 `code_timeout = 5.0` 控制每次代码执行超时。不再解析命令行参数。
-达到上限、拒绝执行或 API 失败时，本次任务显示对应的未完成状态；可继续输入或返回列表，不会自动重放已执行代码。
+达到上限或 API 失败时，任务保留检查点，终端可选择恢复、明确结束或返回列表；拒绝代码执行会取消该任务。不会自动重放已执行代码。
 
 ## 终端对话和分支菜单
 
@@ -85,7 +88,7 @@ export MODEL_AUTH_PREFIX=''
 - 选择旧对话后按 Conversation.id 重新加载文件，默认分支来自保存的 current_leaf_id。
 - 分支列表每项对应一个叶节点，展示其路径中的最后一条用户消息、最后一条助手消息和最后消息时间；“当前”表示已选分支。
 - 回车沿用当前分支，编号选择其他叶节点后立即保存，因此下次打开仍沿用该选择。
-- 未配对工具调用等消息序列不完整的分支标记为“暂不可继续”，不会自动跳到其他分支。
+- 有任务检查点的未结束分支标记为“任务待恢复”或“结果待核对”，打开后显式选择恢复。没有检查点、消息又不完整的旧分支仍标记为“暂不可继续”。
 - 读取失败或校验失败的历史文件单独提示并跳过，不影响其他对话。
 
 | 输入位置 | 输入 | 行为 |
@@ -139,7 +142,7 @@ export MODEL_AUTH_PREFIX=''
 
 `history.py` 管理节点与分支，`memory_store.py` 负责 JSON 编解码和文件读写。
 默认保存位置是项目目录下的 `memory/<conversation_id>.json`，不依赖启动工作目录。
-每个文件包含 `schema_version`、`conversation` 元数据及全部 `nodes`。
+每个文件包含 `schema_version`、`conversation` 元数据、全部 `nodes` 及任务检查点 `tasks`。旧文件没有 tasks 时按空列表加载，不编造历史执行阶段。
 时间保存为带时区的 ISO 8601 字符串，角色保存为字符串，加载时恢复为对应 Python 类型。
 
 Agent 追加用户消息、助手消息或工具结果后都会保存一次。保存前和加载后校验：
@@ -173,10 +176,74 @@ agent.store.save(loaded)
 终端菜单在选择旧对话和连续输入时会显式传入 history；只有用户选择“创建新对话”才新建历史树。
 
 恢复时沿用保存的系统提示词，因此应提供与原对话相符的工具配置。
-若当前分支存在未配对的工具调用与结果，将拒绝继续，不会自动重放。
-工具已产生副作用、但结果尚未写入时也可能出现这种状态，需核对实际文件，
-或明确从更早的完整节点创建分支。创建分支只改变聊天历史，不会恢复或回滚项目文件。
+普通新任务仍要求父节点前的工具调用与结果完整。已有任务通过专门的恢复入口处理待确认或结果未知的调用，不会直接重放。
+没有任务检查点的旧分支若存在未配对调用，无法可靠推断工具是否开始，仍拒绝自动恢复。
+创建分支只改变聊天历史，不会恢复或回滚项目文件。
 历史保存完整消息和工具结果，尚未实现脱敏、加密、摘要或上下文压缩。
+
+## 任务检查点与中断恢复
+
+每次提交新任务时创建 `TaskRun`，通过 `user_node_id` 关联原始用户消息。
+它记录独立任务 ID、最后保存的节点 `checkpoint_node_id`、状态、阶段、活动工具调用 ID、累计模型请求尝试次数、错误和时间。
+同一 Conversation 可保存多个任务记录，不把整段对话简单标记为一个执行中任务。
+
+| 状态 | 含义 |
+| --- | --- |
+| `running` | 任务执行中，或上次进程未正常结束；单凭该字段不能判断进程是否还活着 |
+| `interrupted` | 请求失败或捕获到中断，可从阶段检查点继续 |
+| `needs_review` | 工具结果不确定，先核对进程和副作用 |
+| `limit` | 本次模型轮数预算用尽，可显式恢复 |
+| `completed` | 最终回答和完成状态已保存，表示执行循环结束，不代表修复一定正确 |
+| `cancelled` | 用户明确结束任务，已经产生的修改保留 |
+
+检查点按以下顺序提交：
+
+```text
+用户任务 + running / waiting_model 一起保存
+→ 请求模型（请求尝试次数先保存）
+→ 助手工具请求 + waiting_approval 一起保存
+→ 人工确认
+→ executing_tool + active_tool_call_id 先保存
+→ run_code
+→ 工具结果 + 下一阶段一起保存
+→ 继续请求模型
+→ 最终回答 + completed / finished 一起保存
+```
+
+由 `Agent._checkpoint()` 统一写一份 JSON 快照，避免回答已写入却单独丢失完成标记，或完成标记先于最终回答写入。
+保存失败会停止，不尝试把内存中的未提交状态再补写一次；后续必须重新加载磁盘历史。
+
+打开待恢复分支后，终端展示原任务、阶段和累计轮数，提供“恢复原任务”“结束原任务”“返回列表”：
+
+| 保存阶段 | 恢复行为 |
+| --- | --- |
+| `waiting_model` | 用现有上下文重新请求模型；上次请求可能已到达服务端，可能重复计费 |
+| `waiting_approval` | 重新展示尚未执行的代码并确认，跳过已经保存结果的调用 |
+| `executing_tool` | 不能断定代码是否生效，暂停并要求核对，不直接重跑 |
+| `finished` | 不重复执行已结束的任务 |
+
+超时或工作进程没有返回结果也会暂停为 needs_review，而不是直接自动重试。
+结果未知时，只有用户输入“已核对”，确认旧程序及工具子进程已停止，并记录实际文件/外部操作状态，才可继续。
+核对后为缺失结果的原调用追加 `TOOL_OUTCOME_UNKNOWN`，为同批尚未开始的调用追加 `TOOL_NOT_STARTED`；这些是恢复说明，不是假造成功结果。
+已有超时/未知结果不重复追加。另保存一条明确标记的人工恢复核对消息，让模型依据真实状态继续分析。
+之后如模型提出新代码，仍需逐段人工确认。
+
+底层接口示例，假设 agent 已创建：
+
+```python
+loaded = agent.store.load(conversation_id)
+task = loaded.unfinished_task()
+if task is not None:
+    result = agent.resume(loaded, task.id)
+    # needs_review 会停止在人工核对边界，不自动执行未知结果的代码。
+```
+
+恢复复用原 TaskRun，不重复追加原始 task。累计轮数保留；每次显式恢复最多再使用 max_rounds 次模型请求。
+有未结束任务的同一检查点不接受另一条新任务，用户可先恢复或明确结束原任务。
+本阶段支持单进程使用，不提供会话并发锁，不自动探测或终止旧进程。Ctrl+C 会尽力保存状态；强杀进程无法依赖 finally，工具子进程甚至衍生进程可能仍存活，恢复前必须核对。
+不能把 TaskRun 的标记当作进程已经结束的证明。
+
+JSON 原子替换只覆盖历史快照，不能使“修改项目文件或外部服务”和“保存历史”成为同一事务；没有恰好执行一次、自动回滚或从任意 Python 语句断点继续的保证。
 
 ## 最小用法
 
@@ -209,7 +276,7 @@ print(result.status, result.output, result.error)
 - `tools/search.py`：注入同步搜索函数，真实服务由后续选择和配置。
 - `tools/mcp.py`：注册已连接 MCP 工具的同步适配函数，参数签名需真实反映工具参数。
 - `prompts.py`：只把已注册工具放入系统消息；注册变化后需重新构建消息。
-- `runner.py`：独立进程执行，返回 `success`、`error` 或 `timeout`。
+- `runner.py`：独立进程执行，返回 `success`、`error`、`timeout` 或工作进程无结果时的 `unknown`。
 
 搜索和 MCP 当前只有接入入口，没有真实服务连接。调用方负责认证、客户端生命周期、
 外部请求超时，以及需要时把异步接口包装为同步函数。不要直接继承正在使用的网络连接；
@@ -229,6 +296,39 @@ print(result.status, result.output, result.error)
 `llm.py` 仅向模型 API 声明 `run_code` 一个工具；文件、搜索及 MCP 的签名通过
 系统提示词提供，模型在生成的 Python 中组合调用它们。宿主的 `approved` 参数
 不属于模型可传参数，不允许模型自行批准执行。
+
+## Token 统计模块（尚未接入运行流程）
+
+`token_stats.py` 独立提供请求前的输入估算和响应后的 usage 解析，不导入 Agent、模型客户端或历史管理模块。
+它不发送 API 请求、不改变上下文，也不判断窗口阈值或触发压缩。
+
+```python
+from token_stats import estimate_request_tokens, parse_usage
+
+# 使用实际准备发给 API 的消息字典列表，不传 History、TaskRun 或整个请求体。
+messages = [{"role": "user", "content": "检查代码"}]
+estimate = estimate_request_tokens(messages, tools=[])
+print(estimate.estimated_input_tokens)
+
+# 这里用样例响应演示；以后接入时传完整的 API 响应字典。
+usage = parse_usage({"usage": {
+    "prompt_tokens": 100,
+    "completion_tokens": 20,
+    "total_tokens": 120,
+}})
+print(usage.prompt_tokens)
+```
+
+- `estimate_text_tokens(text)`：默认按 Unicode 字符数 × 2 向上取整，系数 tokens_per_char 可配置。
+- `estimate_request_tokens(messages, tools)`：对 messages 和工具 schema 的紧凑 JSON 表示分别估算，包含工具代码、参数及结果；返回消息、工具定义和额外开销分项。
+- `extra_overhead_tokens` 默认 0，仅在调用方明确掌握额外开销时添加。序列化结构已计入，模块不编造固定的逐消息协议开销。
+- `parse_usage(response)`：读取本次响应的 prompt_tokens、completion_tokens、total_tokens。缺失或 null 保留为 None，明确返回 0 才记录为 0；没有可识别用量时整体返回 None。
+- 无效的计数字段（负数、布尔值、字符串等）抛 ValueError；接入时需要单独处理，不能让统计异常导致重复执行工具。
+
+字符/JSON 估算未经模型分词校准，不是实际计费值，也不是安全上界，后续窗口控制仍需预留输出空间和误差余量。
+API usage 与估算分别保存，不相加成窗口占用，不把历次 total_tokens 累加来判断本次请求大小。
+统计范围由调用方决定，模块不自动选择分支，应传入已经选好的当前请求消息。
+它不估计模型尚未生成的输出，也不将缓存或推理统计子项再次加到总数。
 
 ## 验证
 

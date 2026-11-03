@@ -90,7 +90,7 @@ def run_code(
         try:
             return receiver.recv()
         except EOFError:
-            return RunResult("error", error="工作进程退出，未返回执行结果")
+            return RunResult("unknown", error="工作进程退出，未返回执行结果；可能已产生部分副作用")
     finally:
         sender.close()
         receiver.close()
