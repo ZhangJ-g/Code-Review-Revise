@@ -7,6 +7,9 @@ from models import Message, Role, ToolCall
 
 
 def message_to_dict(message: Message) -> dict:
+    """
+     封装数据给大模型使用
+    """
     data = {"role": message.role.value, "content": message.content}
     if message.tool_calls:
         data["tool_calls"] = [
@@ -49,15 +52,16 @@ def _scan(messages: Sequence[Message]) -> tuple[list[ToolCall], set[int]]:
             pending = {call.id: call for call in message.tool_calls}
             seen.update(ids)
         if not pending:
+            """意思是：处理完当前消息后，如果没有等待结果的工具调用，就把当前位置记为候选切分点。主要看处理之后pending的状态如何 是空的就可以记录为可处理边界"""
             boundaries.add(index)
     return list(pending.values()), boundaries
 
 
 def pending_tool_calls(messages: Sequence[Message]) -> list[ToolCall]:
-    """允许末尾仍有待执行调用，返回尚未匹配结果的调用列表。"""
+    """允许末尾仍有待执行调用，返回尚未匹配结果的调用列表。获取历史记录中尚未得到执行结果的工具调用。"""
     return _scan(messages)[0]
 
 
 def tool_boundary_indices(messages: Sequence[Message]) -> set[int]:
-    """可在其后切分的索引：此前没有尚待匹配结果的工具调用。"""
+    """可在其后切分的索引：此前没有尚待匹配结果的工具调用。获取历史记录中可以安全切分的位置，避免把工具调用和执行结果拆散。"""
     return _scan(messages)[1]

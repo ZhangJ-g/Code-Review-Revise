@@ -1,4 +1,8 @@
-"""独立压缩管理：累计摘要、分支适用性和临时上下文视图。
+"""历史压缩模块：解决“哪些旧历史可以安全地变成摘要，摘要怎样生成和使用”。
+
+ContextManager 判断主请求是否需要压缩，本模块提供压缩能力：确定安全边界、
+选择当前分支适用的累计摘要、生成并保存新摘要，以及构造临时上下文视图。
+这里只检查摘要请求自身的输入/输出预算；整个主请求的窗口控制由 ContextManager 负责。
 
 不导入 Agent、HTTP 客户端、具体存储或执行器；模型和保存能力由调用方注入。
 不自动判断窗口阈值，不执行工具，不改变树结构、当前叶节点或任务状态。
@@ -36,6 +40,25 @@ class _Scope:
 
 
 class CompactionManager:
+    """管理“怎样压缩历史”，供 ContextManager 在需要时调用。
+
+    主要职责：
+    - 确定安全前缀：保留 SYSTEM、当前 TaskRun 和其他未结束/待核对的工作，
+      不拆开已知任务，也不拆开助手工具调用与对应结果。
+    - select()：选择当前路径上覆盖位置最靠后的有效累计摘要，隔离不同分支。
+    - build_context()：按已有摘要构造 SYSTEM + 摘要 + 原始后缀的消息副本；
+      这个方法不生成摘要，也不判断整个主请求是否符合窗口预算。
+    - compact()：结合旧累计摘要和新增历史，通过注入的 summarizer 生成新摘要，
+      校验摘要请求预算、输出和缩小效果，再通过 store 保存独立 Compaction 记录。
+
+    例如任务 1、2 已结束，任务 3 正在执行：可以概括任务 1、2，
+    through_node_id 指向所覆盖的最后节点，任务 3 的原始消息仍完整保留。
+    只新增摘要记录，不删除或改接原始 Session，不移动 current_leaf_id。
+
+    是否触发压缩、压缩后主请求是否仍然超限，由 ContextManager 决定；
+    主请求发送、重试和业务工具执行仍由 Agent 与模型客户端负责。
+    """
+
     def __init__(
         self, summarizer: SummaryGenerator, store: CompactionStore, *,
         max_input_tokens: int, max_summary_tokens: int,

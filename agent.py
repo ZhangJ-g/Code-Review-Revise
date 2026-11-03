@@ -2,15 +2,17 @@
 
 import json
 import math
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Callable, Protocol
 
 from history import History
-from llm import ModelError
+from context_manager import ContextManager, PreparedContext, RequestReport, prepare_messages
+from model_api import ErrorKind, ModelError, ModelReply, RetryPolicy
 from memory_store import JsonMemoryStore
 from message_utils import pending_tool_calls
-from models import Message, Role, Session, TaskRun, ToolCall
+from models import Message, Role, Session, TaskRun, ToolCall, new_id
 from prompts import build_system_message
 from runner import RunResult, run_code
 from tools import ToolRegistry
@@ -37,6 +39,8 @@ class Agent:
         max_rounds: int = 10,
         code_timeout: float = 5.0,
         store: JsonMemoryStore | None = None,
+        context_manager: ContextManager | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         if max_rounds <= 0 or not math.isfinite(code_timeout) or code_timeout <= 0:
             raise ValueError("最大轮数和代码超时必须大于零，超时必须有限")
@@ -49,6 +53,11 @@ class Agent:
         self.history_tree: History | None = None
         self._task: TaskRun | None = None
         self._checkpoint_failed = False
+        self.context_manager = context_manager
+        self.retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
+        self.request_reports: list[RequestReport] = []
+        self.last_round_context: PreparedContext | None = None
+        self.last_round_error: str | None = None
 
     @property
     def history(self) -> list[Session]:
@@ -118,6 +127,9 @@ class Agent:
         self.history_tree = history
         self._task = task
         self._checkpoint_failed = False
+        self.request_reports = []
+        self.last_round_context = None
+        self.last_round_error = None
         if history.conversation.current_leaf_id != task.checkpoint_node_id:
             history.select_leaf(task.checkpoint_node_id)# 如果不同 切换到任务检查点
 
@@ -282,28 +294,102 @@ class Agent:
             )
         return None
 
-    def _loop(self) -> AgentResult:
-        result = self._execute_pending()
-        if result is not None:
-            return result
-        for _ in range(self.max_rounds):
-            self._task.rounds += 1
-            self._checkpoint(phase="waiting_model")
-            reply = self.client.complete([entry.message for entry in self.history])
-            # 这个tool_calls是大模型自带的 ，必定有这个字段  后面就会解析出这个字段了！！！
+    def _prepare_context(
+        self, *, force_compact: bool = False, previous_fingerprint: str | None = None,
+    ) -> PreparedContext:
+        #为当前这次大模型请求准备上下文，
+        if self.context_manager is None:
+            # 保留底层 Agent 的旧用法；main 始终注入带窗口预算的管理器。
+            return prepare_messages([entry.message for entry in self.history],
+                                    getattr(self.client, "tool_definitions", []),
+                                    max_output_tokens=getattr(self.client, "max_output_tokens", None))
+        try:
+            return self.context_manager.prepare(self.history_tree, self._task.id, force_compact=force_compact,
+                                                previous_fingerprint=previous_fingerprint)
+        except OSError:
+            self._checkpoint_failed = True
+            raise  # 摘要保存失败同样要求重新加载，不能补写未提交内存。
+
+    def _validate_reply(self, reply: Message) -> None:
+        try:
+            if not isinstance(reply, Message) or not isinstance(reply.content, str):
+                raise ValueError("invalid message")
             if reply.role != Role.ASSISTANT:
-                raise ModelError("模型未返回助手消息")
+                raise ValueError("unexpected role")
             if not reply.tool_calls and not reply.content.strip():
-                raise ModelError("模型返回空回答，任务尚未完成")
+                raise ValueError("empty reply")
             # 在落盘或执行之前检查新调用的 ID 与历史是否冲突。
             self._pending_calls(self.history + [Session(message=reply)])
+        except (ValueError, TypeError, AttributeError):
+            raise ModelError("助手响应为空、格式无效或工具调用 ID 冲突；未写入历史或执行工具",
+                             kind=ErrorKind.RESPONSE_INVALID) from None
+
+    def _request_reply(self) -> Message:
+        # 预检/摘要有自己的错误边界，不能被当作主请求错误再次整轮重试。
+        prepared = self._prepare_context()
+        context_recovered = False
+        for attempt in range(1, self.retry_policy.max_attempts + 1):
+            self._task.rounds += 1  # 记录实际请求尝试；一次决策可能有多次请求。
+            self._checkpoint(phase="waiting_model")
+            report = RequestReport(new_id(), prepared.fingerprint, prepared.compaction_id,
+                                   prepared.estimate.estimated_input_tokens, prepared.input_budget)
+            self.request_reports.append(report)
+            try:
+                complete_with_usage = getattr(self.client, "complete_with_usage", None)
+                if complete_with_usage is not None:
+                    cap = self.context_manager.config.max_output_tokens if self.context_manager else None
+                    result = complete_with_usage(prepared.messages, max_output_tokens=cap)
+                else:
+                    result = ModelReply(self.client.complete(prepared.messages))
+                if not isinstance(result, ModelReply):
+                    raise ModelError("模型客户端必须返回 ModelReply", kind=ErrorKind.RESPONSE_INVALID)
+                report.usage, report.usage_error = result.usage, result.usage_error
+                report.response_id = result.response_id
+                self._validate_reply(result.message)
+                return result.message
+            except ModelError as error:
+                report.error_kind = error.kind
+                if error.kind == ErrorKind.CONTEXT_LIMIT:
+                    if (self.context_manager is None or context_recovered
+                            or attempt >= self.retry_policy.max_attempts):
+                        raise
+                    context_recovered = True
+                    prepared = self._prepare_context(force_compact=True, previous_fingerprint=prepared.fingerprint)
+                    continue
+                delay = self.retry_policy.delay(attempt, error)
+                if delay is None:
+                    raise
+                time.sleep(delay)
+
+    def _after_round(self) -> None:
+        """循环结束只观察新视图，不请求摘要，也不改变任务检查点。"""
+        self.last_round_context = None
+        self.last_round_error = None
+        try:
+            if self.context_manager is None:
+                self.last_round_context = self._prepare_context()
+            else:
+                self.last_round_context = self.context_manager.inspect(self.history_tree, self._task.id)
+        except Exception as error:
+            self.last_round_error = f"本轮上下文统计失败（{type(error).__name__}），任务执行结果已保留"
+
+    def _loop(self) -> AgentResult:
+        if self._pending_calls(self.history):#寻找未完成，_pending_calls
+            result = self._execute_pending()#执行未完成
+            self._after_round()
+            if result is not None:
+                return result
+        for _ in range(self.max_rounds):
+            reply = self._request_reply()
             if not reply.tool_calls:
                 self._checkpoint(phase="finished", status="completed", messages=(reply,))
+                self._after_round()
                 return AgentResult("completed", reply.content, self._task.rounds)
             self._checkpoint(#传进去直接更新检查点
                 phase="waiting_approval", active_tool_call_id=reply.tool_calls[0].id, messages=(reply,),
             )
             result = self._execute_pending()#带检查点的都是没有执行完的交给他继续执行完
+            self._after_round()
             if result is not None:
                 return result
         self._checkpoint(phase="waiting_model", status="limit", error="达到本次模型轮数上限")#传进去直接更新检查点
@@ -313,7 +399,7 @@ class Agent:
         try:
             return self._loop()
         except KeyboardInterrupt:
-            if not self._checkpoint_failed:
+            if not self._checkpoint_failed and self._task.status not in {"completed", "cancelled"}:
                 task = self._task
                 try:
                     self._checkpoint(
@@ -328,6 +414,11 @@ class Agent:
             if self._checkpoint_failed:
                 raise
             task = self._task
+            if task.status in {"completed", "cancelled"}:
+                raise  # 已提交的完成状态不能被后续观测错误改成 interrupted。
             status = "needs_review" if task.phase == "executing_tool" else "interrupted"
             self._checkpoint(phase=task.phase, status=status, active_tool_call_id=task.active_tool_call_id, error=str(error))
+            self._after_round()
+            if isinstance(error, ModelError) and error.kind == ErrorKind.CONFIGURATION:
+                raise  # 配置错误保留检查点后，交给入口停止并报告。
             return AgentResult("needs_review" if status == "needs_review" else "error", str(error), task.rounds)

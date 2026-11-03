@@ -25,6 +25,28 @@ def display_time(value: datetime) -> str:
     return value.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def display_token_report(agent: Agent) -> None:
+    """服务端 usage 对应最后一次实际请求；当前视图只显示估算。"""
+    if agent.request_reports:
+        last = agent.request_reports[-1]
+        print(f"本次模型请求尝试：{len(agent.request_reports)} 次；最后请求输入估算：{last.estimated_input_tokens} token")
+        if last.usage is not None:
+            usage = last.usage
+            prompt = "未知" if usage.prompt_tokens is None else usage.prompt_tokens
+            completion = "未知" if usage.completion_tokens is None else usage.completion_tokens
+            print(f"该请求 API 用量：输入 {prompt}，输出 {completion} token")
+        else:
+            print("该请求 API 未提供有效 usage，使用发送前估算。")
+        if last.usage_error:
+            print(last.usage_error)
+    view = agent.last_round_context
+    if view is not None:
+        budget = "未配置" if view.input_budget is None else str(view.input_budget)
+        print(f"本轮结束的上下文输入估算：{view.estimate.estimated_input_tokens} token；输入预算：{budget}")
+    if agent.last_round_error:
+        print(agent.last_round_error)
+
+
 def choose_conversation(agent: Agent) -> History | None:
     while True:
         conversations, notices = agent.store.list_conversations()
@@ -181,8 +203,9 @@ def recover_pending_task(agent: Agent, history: History) -> bool:
             return False
         agent.acknowledge_unknown(history, task.id, note, confirmed_stopped=True)
     result = agent.cancel_task(history, task.id) if choice == "2" else agent.resume(history, task.id)
-    print(f"\n状态：{result.status}，累计模型轮数：{result.rounds}")
+    print(f"\n状态：{result.status}，累计模型请求尝试：{result.rounds}")
     print(result.answer)
+    display_token_report(agent)
     return True
 
 
@@ -227,5 +250,6 @@ def run_cli(agent: Agent) -> int:
                 print(f"当前对话已停止：{error}")
                 print("返回对话列表；请以磁盘保存的状态为准，已经产生的文件修改不会回滚。")
                 break
-            print(f"\n状态：{result.status}，模型轮数：{result.rounds}")
+            print(f"\n状态：{result.status}，累计模型请求尝试：{result.rounds}")
             print(result.answer)
+            display_token_report(agent)
