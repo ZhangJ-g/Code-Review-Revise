@@ -10,6 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from models import Message, Role, ToolCall
+from message_utils import message_to_dict
 from dotenv import load_dotenv
 
 
@@ -79,25 +80,6 @@ class ModelConfig:
         )
 
 
-def message_to_dict(message: Message) -> dict:
-    data = {"role": message.role.value, "content": message.content}
-    if message.tool_calls:
-        data["tool_calls"] = [
-            {
-                "id": call.id,
-                "type": "function",
-                "function": {
-                    "name": call.name,
-                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
-                },
-            }
-            for call in message.tool_calls
-        ]
-    if message.tool_call_id is not None:
-        data["tool_call_id"] = message.tool_call_id
-    return data
-
-
 def parse_response(payload: dict) -> Message:
     try:
         choice = payload["choices"][0]
@@ -137,6 +119,24 @@ class ChatClient:
         self.config = config
 
     def complete(self, messages: list[Message]) -> Message:
+        return parse_response(self._request(messages, with_tools=True))
+
+    def summarize(self, messages: list[Message], *, max_output_tokens: int) -> str:
+        """独立无工具请求，仅返回摘要文本，不触发任何工具执行。"""
+        if type(max_output_tokens) is not int or max_output_tokens <= 0:
+            raise ValueError("摘要输出预算必须是正整数")
+        if any(message.tool_calls or message.tool_call_id is not None for message in messages):
+            raise ValueError("摘要请求只接受文本消息，原工具记录应作为待总结的数据")
+        payload = self._request(messages, with_tools=False, max_output_tokens=max_output_tokens)
+        reply = parse_response(payload)
+        if reply.tool_calls or payload["choices"][0]["finish_reason"] != "stop":
+            raise ModelError("摘要请求返回了工具调用或未正常结束，拒绝使用")
+        return reply.content.strip()
+
+    def _request(
+        self, messages: list[Message], *, with_tools: bool,
+        max_output_tokens: int | None = None,
+    ) -> dict:
         config = self.config
         headers = {"Content-Type": "application/json", **config.extra_headers}
         if config.api_key:
@@ -144,10 +144,12 @@ class ChatClient:
         body = {
             "model": config.model,
             "messages": [message_to_dict(message) for message in messages],
-            "tools": [RUN_CODE_TOOL],
-            "tool_choice": "auto",
             "stream": False,
         }
+        if with_tools:
+            body.update(tools=[RUN_CODE_TOOL], tool_choice="auto")
+        if max_output_tokens is not None:
+            body["max_tokens"] = max_output_tokens
         try:
             request = Request(
                 config.endpoint,
@@ -187,4 +189,4 @@ class ChatClient:
             ) from None
         except UnicodeError:
             raise ModelError("模型响应编码无效，无法按 JSON 读取") from None
-        return parse_response(payload)
+        return payload

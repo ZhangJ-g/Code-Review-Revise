@@ -3,7 +3,8 @@
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
-from models import Conversation, Message, Role, Session, TaskRun
+from message_utils import pending_tool_calls
+from models import Compaction, Conversation, Message, Role, Session, TaskRun
 
 
 def excerpt(text: str, limit: int = 40) -> str:
@@ -31,7 +32,10 @@ def require_timestamp(value: datetime) -> None:
 
 
 class History:
-    def __init__(self, conversation: Conversation, nodes: list[Session], tasks: list[TaskRun] | None = None) -> None:
+    def __init__(
+        self, conversation: Conversation, nodes: list[Session],
+        tasks: list[TaskRun] | None = None, compactions: list[Compaction] | None = None,
+    ) -> None:
         self.conversation = conversation
         self.nodes: dict[str, Session] = {}
         for node in nodes:
@@ -45,6 +49,12 @@ class History:
             if task.id in self.tasks:
                 raise ValueError("历史中存在重复任务 ID")
             self.tasks[task.id] = task
+        self.compactions: dict[str, Compaction] = {}
+        for record in compactions or []:
+            require_id(record.id)
+            if record.id in self.compactions:
+                raise ValueError("历史中存在重复压缩记录 ID")
+            self.compactions[record.id] = record
         self.validate()
 
     @classmethod
@@ -109,6 +119,32 @@ class History:
         if self.nodes[metadata.current_leaf_id].children_ids:
             raise ValueError("current_leaf_id 必须指向叶节点")
         self._validate_tasks()
+        self._validate_compactions()
+
+    def _validate_compactions(self) -> None:
+        for record_id, record in self.compactions.items():
+            require_id(record.id)
+            require_id(record.through_node_id)
+            require_timestamp(record.created_at)
+            if record_id != record.id or not isinstance(record.summary, str) or not record.summary.strip():
+                raise ValueError("压缩记录 ID 或摘要无效")
+            if record.through_node_id not in self.nodes or record.through_node_id == self.conversation.root_id:
+                raise ValueError("压缩边界必须指向存在的非根节点")
+            path = []
+            node_id = record.through_node_id
+            while node_id is not None:
+                path.append(self.nodes[node_id])
+                node_id = self.nodes[node_id].parent_id
+            path.reverse()
+            if pending_tool_calls([entry.message for entry in path]):
+                raise ValueError("压缩边界不能拆开工具调用与结果")
+            if record.base_compaction_id is not None:
+                require_id(record.base_compaction_id)
+                base = self.compactions.get(record.base_compaction_id)
+                if base is None or base.id == record.id:
+                    raise ValueError("基础摘要不存在或自引用")
+                if base.through_node_id not in {entry.id for entry in path[:-1]}:
+                    raise ValueError("基础摘要边界必须是新边界的严格祖先")
 
     def _validate_tasks(self) -> None:
         open_checkpoints = set()

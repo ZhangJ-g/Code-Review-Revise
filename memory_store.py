@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from history import History, excerpt, require_timestamp
-from models import Conversation, Message, Role, Session, TaskRun, ToolCall
+from models import Compaction, Conversation, Message, Role, Session, TaskRun, ToolCall
 
 
 def _time_from_json(value: str) -> datetime:
@@ -61,7 +61,13 @@ def history_to_dict(history: History) -> dict:
         for key in ("created_at", "updated_at", "finished_at"):
             data[key] = data[key].isoformat() if data[key] is not None else None
         tasks.append(data)
-    return {"schema_version": 1, "conversation": metadata, "nodes": nodes, "tasks": tasks}
+    compactions = []
+    for record in history.compactions.values():
+        data = asdict(record)
+        data["created_at"] = record.created_at.isoformat()
+        compactions.append(data)
+    return {"schema_version": 1, "conversation": metadata, "nodes": nodes,
+            "tasks": tasks, "compactions": compactions}
 
 
 def history_from_dict(data: dict) -> History:
@@ -101,7 +107,18 @@ def history_from_dict(data: dict) -> History:
             if task["finished_at"] is not None:
                 task["finished_at"] = _time_from_json(task["finished_at"])
             tasks.append(TaskRun(**task))
-        history = History(conversation, nodes, tasks)
+        raw_compactions = data.get("compactions", [])
+        if not isinstance(raw_compactions, list):
+            raise ValueError("compactions 必须是列表")
+        compactions = []
+        for raw_record in raw_compactions:
+            record = dict(raw_record)
+            for key in ("id", "through_node_id", "summary", "created_at"):
+                if key not in record:
+                    raise ValueError("压缩记录缺少必要字段")
+            record["created_at"] = _time_from_json(record["created_at"])
+            compactions.append(Compaction(**record))
+        history = History(conversation, nodes, tasks, compactions)
         # 旧文件没有 title 时从首条用户消息恢复展示标题，不在读取时改写文件。
         if not history.conversation.title.strip():
             users = [node for node in nodes if node.message.role == Role.USER]

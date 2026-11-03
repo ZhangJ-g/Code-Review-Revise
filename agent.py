@@ -9,6 +9,7 @@ from typing import Callable, Protocol
 from history import History
 from llm import ModelError
 from memory_store import JsonMemoryStore
+from message_utils import pending_tool_calls
 from models import Message, Role, Session, TaskRun, ToolCall
 from prompts import build_system_message
 from runner import RunResult, run_code
@@ -57,28 +58,7 @@ class Agent:
     @staticmethod
     def _pending_calls(entries: list[Session]) -> list[ToolCall]:
         """检查消息关联，按声明顺序返回尚未得到结果的调用。"""
-        if not entries or entries[0].message.role != Role.SYSTEM:
-            raise ValueError("Agent 历史必须以系统消息为根节点")
-        pending = {}  # 已发起、尚未找到对应工具结果的调用 ID → 调用。
-        seen = set()  # 当前分支中已出现过的全部调用 ID，用于检查重复。
-        for entry in entries[1:]:
-            message = entry.message
-            if message.role == Role.SYSTEM:
-                raise ValueError("系统消息只能位于历史根节点")
-            if pending:
-                if message.role != Role.TOOL or message.tool_call_id not in pending:
-                    raise ValueError("历史工具调用与结果不匹配，不能继续对话")
-                # 找到结果后只从 pending 移除；seen 保留该 ID，防止后续重复使用。
-                del pending[message.tool_call_id]
-            elif message.role == Role.TOOL:
-                raise ValueError("历史存在未关联工具调用的工具结果")
-            elif message.tool_calls:
-                ids = [call.id for call in message.tool_calls]
-                if len(ids) != len(set(ids)) or seen.intersection(ids):
-                    raise ValueError("当前分支存在重复工具调用 ID")
-                pending = {call.id: call for call in message.tool_calls}
-                seen.update(ids)
-        return list(pending.values())
+        return pending_tool_calls([entry.message for entry in entries])
 
     @staticmethod
     def _check_resumable(entries: list[Session]) -> None:

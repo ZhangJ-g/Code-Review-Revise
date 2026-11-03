@@ -142,7 +142,7 @@ export MODEL_AUTH_PREFIX=''
 
 `history.py` 管理节点与分支，`memory_store.py` 负责 JSON 编解码和文件读写。
 默认保存位置是项目目录下的 `memory/<conversation_id>.json`，不依赖启动工作目录。
-每个文件包含 `schema_version`、`conversation` 元数据、全部 `nodes` 及任务检查点 `tasks`。旧文件没有 tasks 时按空列表加载，不编造历史执行阶段。
+每个文件包含 `schema_version`、`conversation` 元数据、全部 `nodes`、任务检查点 `tasks` 和独立压缩记录 `compactions`。旧文件没有 tasks/compactions 时按空列表加载，不编造历史执行阶段或摘要。
 时间保存为带时区的 ISO 8601 字符串，角色保存为字符串，加载时恢复为对应 Python 类型。
 
 Agent 追加用户消息、助手消息或工具结果后都会保存一次。保存前和加载后校验：
@@ -179,7 +179,7 @@ agent.store.save(loaded)
 普通新任务仍要求父节点前的工具调用与结果完整。已有任务通过专门的恢复入口处理待确认或结果未知的调用，不会直接重放。
 没有任务检查点的旧分支若存在未配对调用，无法可靠推断工具是否开始，仍拒绝自动恢复。
 创建分支只改变聊天历史，不会恢复或回滚项目文件。
-历史保存完整消息和工具结果，尚未实现脱敏、加密、摘要或上下文压缩。
+历史始终保存完整消息和工具结果，尚未实现脱敏或加密。独立压缩模块见下文，尚未接入 Agent 的自动上下文控制。
 
 ## 任务检查点与中断恢复
 
@@ -329,6 +329,95 @@ print(usage.prompt_tokens)
 API usage 与估算分别保存，不相加成窗口占用，不把历次 total_tokens 累加来判断本次请求大小。
 统计范围由调用方决定，模块不自动选择分支，应传入已经选好的当前请求消息。
 它不估计模型尚未生成的输出，也不将缓存或推理统计子项再次加到总数。
+
+## 独立上下文压缩模块（尚未自动接入 Agent）
+
+`compaction.py` 的 `CompactionManager` 只生成和选择摘要，以及构造模型可见的临时上下文。
+它不修改原消息、parent_id、children_ids、root_id、current_leaf_id 或 TaskRun，也不创建摘要 Session。
+摘要保存到同一个对话 JSON 的 compactions 集合，原始树和旧摘要继续保留。
+
+| Compaction 字段 | 含义 |
+| --- | --- |
+| `id` | 独立压缩记录 ID |
+| `through_node_id` | 从系统根之后累计覆盖到的节点，包含该节点 |
+| `summary` | 完整累计摘要，不只是本次新增部分 |
+| `created_at` | 带时区的创建时间 |
+| `base_compaction_id` | 可选的基础摘要 ID，用于追溯增量来源；其边界必须是新边界的严格祖先 |
+
+模块依赖关系如下，两个 Protocol 均通过方法签名满足，不需要客户端或存储继承管理器的类型：
+
+```mermaid
+flowchart LR
+    C[CompactionManager] --> H[History 和数据模型]
+    C --> S[SummaryGenerator 协议]
+    C --> P[CompactionStore 协议]
+    L[ChatClient] -. 满足 summarize 接口 .-> S
+    J[JsonMemoryStore] -. 满足 save 接口 .-> P
+```
+
+`message_utils.py` 独立提供 API 消息编码、待匹配工具调用和完整工具单元边界，供 Agent、历史校验和压缩复用。
+压缩模块不导入 Agent、HTTP 客户端、具体存储或执行器。
+`ChatClient.summarize()` 是单独的无工具请求入口，复用 HTTP 传输但不提供 tools，不经过任务或工具执行循环；收到工具调用、空内容或未正常结束的响应即拒绝。
+
+### 压缩范围和分支选择
+
+调用方必须显式提供 current_task_id。该 TaskRun 必须在当前路径中，检查点与当前叶节点一致；缺失或不匹配时拒绝操作，不猜测任务起点。
+SYSTEM 始终保留，当前 TaskRun 从 user_node_id 开始的全部消息均保留。
+路径中更早的未结束任务、待核对工作及无法在本路径确认已经结束的共享任务，会收缩可压缩前缀。
+旧数据存在明确未知结果却缺少结束记录时，保守保留不能确认的后续区间。
+
+已知 TaskRun 不从中间切开。助手调用与该批全部工具结果也不能拆分，当前任务末尾仍未配对的调用可以存在，但不会进入摘要。
+其他分支的专属消息不作为输入；共享任务起点但结束点不在本路径时，不擅自推断共享部分已经完成。
+
+选择摘要时只考虑边界位于当前路径、安全前缀中的记录，按路径覆盖位置选择最靠后的一条；时间只用于相同覆盖位置的择优。
+公共祖先摘要可被多个分支复用，分叉后的摘要只能用于包含其边界的路径。
+
+```text
+第一次：原始历史 a → b → c                    → S1，覆盖到 c
+第二次：已有 S1 + 新增原始历史 d → e → f      → S2，累计覆盖到 f
+```
+
+S2 构建上下文时独立使用，不再同时发送 S1；S1 留在文件中供其他路径使用。
+相同边界已有可用摘要时直接复用，不重复请求模型。加载和校验仍会遍历历史，并非零成本。
+
+### 调用方式
+
+下面假设调用方已明确取得 history、current_task_id、模型客户端 client 和 store。预算仅为示例，需要与实际模型窗口及输出预留匹配：
+
+```python
+from compaction import CompactionManager
+
+manager = CompactionManager(
+    summarizer=client,       # 提供 summarize(messages, max_output_tokens=...) -> str
+    store=store,             # 提供 save(history)
+    max_input_tokens=20_000,
+    max_summary_tokens=1_000,
+)
+
+# 默认压缩当前任务之前最靠后的安全前缀，也可明确指定 through_node_id。
+record = manager.compact(history, current_task_id)
+messages = manager.build_context(history, current_task_id)
+# messages 为 SYSTEM + 带来源标记的临时历史摘要 + 边界之后的原始消息。
+# 此处只构造视图；当前 Agent 仍发送原始 history，尚未自动采用这个视图。
+```
+
+没有适用摘要时 build_context 返回原始当前路径的消息副本。摘要使用明确标记的临时 USER 上下文资料，不是新的任务或原始用户发言，不追加到历史或创建 TaskRun，也不提升为系统指令。
+返回消息使用副本，修改临时视图不会修改原节点。摘要选择和生成均不移动叶节点。
+
+### 摘要请求与失败处理
+
+摘要请求的输入是已有累计摘要、增量消息及相关任务状态；原工具调用、代码、参数和结果编码为文本数据，而非 API 工具消息。
+提示词要求保留目的与约束、工具及关键参数、执行结果、实际影响、验证、后续计划和不确定信息；缺失原因标为未说明，不能把运行成功或 TaskRun completed 解释为修复已验证。
+run_code 中静态出现的内部工具名称不等于它实际执行过，摘要需保留这种区别。
+
+请求前用 token_stats 粗估摘要输入；超出输入预算就拒绝发送，第一版不自动分块。
+服务端通过 max_tokens 限制输出；本地再检查输出估算预算、非空和实际缩小效果。
+字符估算不是精确分词或安全上界，真实接口仍可能拒绝请求。程序也无法证明摘要内容完全准确或没有遗漏，需要真实模型案例评估。
+
+新记录保存失败时撤下内存中的候选，已有摘要和原历史保留。无效摘要或未缩小输入也不创建记录。
+当前 TaskRun 太大时不能靠压缩它来解决；后续窗口管理仍需重新统计完整请求，包括 SYSTEM 和工具定义，决定是否暂停或限制新增输出。
+摘要保存不改 Conversation 更新时间，保留原对话活动时间；摘要自身有独立创建时间。
+本模块按串行使用设计，不支持生成期间并发编辑原始 History，不提供自动阈值触发、GUI 或任务恢复替代机制。
 
 ## 验证
 

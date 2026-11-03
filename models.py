@@ -95,3 +95,14 @@ class TaskRun:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     finished_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class Compaction:
+    """累计摘要：覆盖系统根之后至 through_node_id（含），不替代原节点。"""
+
+    through_node_id: str
+    summary: str
+    id: str = field(default_factory=new_id)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    base_compaction_id: str | None = None
