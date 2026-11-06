@@ -1,11 +1,12 @@
 #```python
-from tools import ToolRegistry, register_file_tools
-from prompts import build_system_message
-from runner import run_code
+from backend.tools import ToolRegistry, register_file_tools
+from backend.prompts import build_system_message
+from backend.runner import run_code
+from backend.paths import PROJECT_ROOT
 
 if __name__ == "__main__":
     registry = ToolRegistry()# 注册工具对象
-    register_file_tools(registry, ".")#传入对象进行工具注册，让registry有工具的属性
+    register_file_tools(registry, PROJECT_ROOT)#传入对象进行工具注册，让registry有工具的属性
     system_message = build_system_message(registry)
     # 接入模型后，将 system_message 和历史消息一同发送给模型。
     print(system_message.content)

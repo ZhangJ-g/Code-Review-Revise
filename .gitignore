@@ -1,0 +1,6 @@
+.env
+backend/.env
+.venv/
+__pycache__/
+*.py[cod]
+.runtime/

@@ -1,7 +1,41 @@
 # 代码检查修复助手
 
-使用 Python 3.10+，通过 `python-dotenv` 加载项目目录的 `.env`。
+使用 Python 3.10+，通过 `python-dotenv` 加载 `backend/.env`。
 当前执行器需要 Linux 等支持 `fork` 的系统。
+
+## 项目目录
+
+后端源码集中在 `backend/`，前端位于 `frontend/`，通过本机 API 管理对话、任务、分支和工具审批。
+Web 和 CLI 复用同一个 Agent 执行循环与历史存储；项目写入锁保证两个入口不同时修改同一项目。
+以下说明中的 Python 模块名均指 `backend/` 中的对应模块。
+
+```text
+项目根目录/
+├── backend/
+│   ├── __init__.py
+│   ├── main.py                # CLI 模块入口
+│   ├── web_main.py            # 本地 Web 模块入口
+│   ├── .env                   # 模型配置，内容沿用原文件
+│   ├── paths.py               # 项目、配置、历史和前端路径
+│   ├── agent_factory.py       # CLI/Web 共用组装入口
+│   ├── runtime_lock.py        # 项目写入互斥
+│   ├── agent.py / cli.py
+│   ├── models.py / history.py / memory_store.py
+│   ├── llm.py / model_api.py / prompts.py
+│   ├── runner.py / message_utils.py / token_stats.py
+│   ├── context_manager.py / compaction.py
+│   ├── api/                   # 路由、快照转换、进程与审批适配
+│   └── tools/                 # 原有文件、搜索和 MCP 工具
+├── frontend/                  # HTML、CSS、JavaScript 和本地 SVG
+├── tests/                     # 原有三个测试模块
+├── memory/                    # 原有历史，位置保持不变
+├── test.py                    # 原有调试脚本
+├── error.py                   # 原有待检查样例
+└── requirements.txt
+```
+
+`backend.paths` 统一定义路径：配置位于 `backend/.env`，历史位于根目录 `memory/`，
+CLI 文件工具根目录仍为项目根目录。模块采用包内相对导入，两个入口同时支持直接运行文件和从项目根目录以模块方式启动。
 
 ## Python 环境与 Debug
 
@@ -9,17 +43,98 @@
 
 ```bash
 .venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python main.py
+.venv/bin/python -m backend.main
 ```
 
-直接运行或 Debug `main.py`，在终端选择对话和分支后输入自己的任务，无需配置任务参数。
+运行 `backend.main` 模块，在终端选择对话和分支后输入自己的任务，无需配置任务参数。
 VS Code 中也可以选择“Debug 代码检查助手（项目虚拟环境）”配置，按 F5 后操作终端菜单。
-该配置显式使用 `.venv/bin/python`，并使用集成终端接收代码执行确认。
+该配置显式使用 `.venv/bin/python`、`module: backend.main` 和项目根工作目录，并使用集成终端接收代码执行确认。
+调试测试时打开 `tests/test_*.py`，选择“Debug Current Test”，按 `tests.<文件名>` 模块启动。
 普通运行时也应通过“Python: Select Interpreter”选择项目虚拟环境。
-PyCharm 中将项目及运行配置的解释器设为项目 `.venv/bin/python`，运行后在控制台选择对话并输入任务。
+PyCharm 中将解释器设为项目 `.venv/bin/python`，运行配置使用模块名 `backend.main`，工作目录设为项目根目录。
+也可以打开 `backend/main.py`，点击“在终端中运行 Python 文件”；入口会根据自身文件位置补齐包路径，不依赖终端当前目录。
 
 终端入口自动启用标准库 `readline` 的行编辑，处理中文退格和光标移动；不额外保存输入历史。
 Debug 时使用集成终端，IDE 的调试控制台未必支持同样的终端编辑行为。
+
+## 本地 Web 工作台
+
+在项目根目录运行：
+
+```bash
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m backend.web_main
+```
+
+浏览器打开 `http://127.0.0.1:8888`；也可以直接运行 `backend/web_main.py`，或在 VS Code 选择“Debug Web 工作台”后按 F5。
+CLI 继续使用 `.venv/bin/python -m backend.main`。Web 新增 Flask 作为 HTTP 依赖，前端无需 Node、构建工具、TypeScript 或 CDN。
+
+界面支持新建/加载对话、提交任务、原始消息、工具代码与结果、逐次审批、分支切换和创建、检查点恢复、Token 用量及累计摘要。
+三栏工作台支持明暗主题、独立收起左右面板；窄屏通过抽屉查看导航与详情。支持 Ctrl/Cmd+K 搜索、最新消息定位及摘要覆盖边界跳转。
+
+外观与布局：
+
+- 首次访问跟随系统明暗主题；右上角太阳/月亮按钮直接切换。左下角工作空间或设置按钮打开“工作台偏好”，可选择浅色、深色或跟随系统，无需刷新。
+- 主题与桌面面板折叠偏好仅保存在当前浏览器的 localStorage，不包含消息、审批或模型配置；存储不可用时仍可切换，刷新后回到系统主题。
+- 桌面左栏约 248～256px、右栏约 300～312px，消息最大宽度 900px。右栏在 1180px 及以下改为抽屉，左栏在 760px 及以下改为抽屉，两侧均有显示/收起按钮。
+- 抽屉支持 Escape 关闭和 Tab 焦点约束；关闭后归还入口焦点。Ctrl/Cmd+K 会展开必要的导航并聚焦搜索；偏好窗口提供“恢复默认布局”。
+- 工具调用以可展开的执行记录展示，保留完整代码、调用 ID、结果状态和复制操作。审批区仍单独展示原始代码，只批准当前一次调用。
+- 输入框随内容增高，Enter 换行、Ctrl/Cmd+Enter 发送。发送中仅表示正在提交请求，Agent 阶段继续依据真实后台状态展示。
+- 配色统一由 styles.css 的 CSS Variables 管理，含代码、错误、状态、弹窗与明暗主题；尊重系统减少动态效果设置。前端仍为原生 HTML/CSS/JavaScript，无构建或新增 UI 依赖。
+
+使用流程：
+
+- 新建对话会保存系统根节点，首条任务自动生成标题。在输入框描述任务后发送，或按 Ctrl/Cmd+Enter；Enter 换行。
+- 用户消息和 running 检查点保存成功后，提交接口返回任务 ID。后台执行不阻塞 HTTP；刷新或关闭浏览器不会重复提交，也不会默认批准。
+- 模型申请工具调用时显示完整、只读的 Python 代码。批准仅作用于该次调用，多调用逐条确认；取消沿用 Agent 的取消语义，保留此前的实际文件修改。
+- 空闲时选择分支会保存 current_leaf_id；执行或等待审批时只能预览其他分支，不改变实际执行路径。点击“查看正在执行的任务”可返回审批所在位置。
+- 消息旁的“从这里继续”只选择父节点；提交新任务时才创建分支。原节点与原分支保留，项目文件不会恢复到旧版本。
+- 后台不在执行时，未完成任务提供恢复/结束操作；executing_tool 或 needs_review 必须先确认旧进程停止并记录实际核对结果。核对说明属于原任务，不创建另一条 TaskRun。
+- Token 面板区分当前上下文估算与最近一次请求的 API usage。“用于当前预览”的摘要来自读取视图，“最近请求使用”来自实际请求记录，二者不混用。
+- 执行状态按约 1 秒轮询，空闲时约 5 秒，隐藏页面暂停；ETag 避免重复传输。配置改变后需重启 Web 服务。
+
+执行服务与兼容边界：
+
+- Web 启动一个非 daemon 的 spawn 进程，内部单线程运行现有 Agent；HTTP 进程通过 Pipe 传命令和观测事件。审批回调等待用户决定后仍返回 True/False，不重建任务或重置当前轮数预算。
+- 全局同一时刻执行一条任务，包括等待审批阶段。项目锁由后台进程持有；开启 Web 写入服务时 CLI 会提示项目被占用，关闭 Web 后即可启动 CLI。
+- 若其他 CLI/Web 已持有锁，新 Web 入口退为浏览模式；停止原入口后需重启 Web 才能获得执行能力。独立 `create_app()` 不注入服务时也保持只读能力。
+- 关闭服务会尽力中断任务并保留检查点；强杀、超时或未知副作用仍需人工核对，不提供跨文件事务、自动回滚或恰好一次执行保证。
+- 新建、浏览、核对和结束任务不需要请求模型；执行任务使用原 backend/.env 配置。模型配置错误会报告原因；执行前配置无效时请求可直接被拒绝，已开始的任务则保留检查点。
+- 运行期 usage、进程状态和请求去重记录保存在内存；服务重启后不补造历史实测值。旧审批失效，恢复任务后会重新请求批准。
+- 写操作校验完整历史版本，GET 仍不保存历史或触发摘要。检测到历史被外部程序改变时拒绝覆盖；不支持绕开写入锁并发修改历史文件。
+
+| 只读接口 | 返回内容 |
+| --- | --- |
+| `GET /api/info` | 浏览模式、可用能力与上下文配置状态，不返回模型密钥 |
+| `GET /api/session` | 当前浏览器的 CSRF 凭证，通过 HttpOnly / SameSite Cookie 关联 |
+| `GET /api/conversations` | 对话元数据、更新时间及无法加载的文件提示 |
+| `GET /api/conversations/<id>` | 默认分支消息、分支列表、相关任务、统计及摘要 |
+| `GET /api/conversations/<id>?leaf_id=<leaf>` | 其他叶节点的只读快照 |
+
+以下写接口都要求 JSON 和 X-CSRF-Token，并携带唯一 client_request_id；已有会话操作还要携带 expected_revision（完整历史版本）。
+提交、恢复、审批返回 202 表示操作已接收，不代表任务完成；状态以之后的检查点为准。相同请求 ID 与参数在当前服务运行期去重，过期版本或审批返回 409，前端不盲目重发。
+
+前端优先使用 `crypto.randomUUID()` 生成请求 ID；浏览器未提供该方法时（例如非本机 HTTP 页面），
+使用 `crypto.getRandomValues()` 生成 UUID，避免在请求发出前报错。此兼容不替代 HTTPS 或访问认证。
+“操作结果尚未确认”仅用于写请求的网络失败；页面代码错误与读取失败会单独报告。
+结果未知的写请求仍在当前页面内保留原请求 ID 和参数，重试时不生成新的 ID。
+
+| 写接口 | 业务输入 |
+| --- | --- |
+| `POST /api/conversations` | 创建空对话 |
+| `POST /api/conversations/<id>/branches/select` | leaf_id |
+| `POST /api/conversations/<id>/tasks` | text、可选 parent_id |
+| `POST /api/conversations/<id>/tasks/<task>/approval` | approval_id、tool_call_id、decision（approve/reject） |
+| `POST /api/conversations/<id>/tasks/<task>/resume` | confirmed_stopped=true |
+| `POST /api/conversations/<id>/tasks/<task>/review` | confirmed_stopped=true、note |
+| `POST /api/conversations/<id>/tasks/<task>/cancel` | 结束原任务，未知副作用需先核对 |
+
+`backend/api/app.py` 负责 HTTP、请求校验和静态资源白名单；`serializers.py` 负责页面快照；
+`service.py` 管理后台进程、请求去重和运行观测；`worker.py` 串行调用现有 Agent，并将用户决定交给审批回调。
+保存成功后才发布观测事件，通知失败不伪装成保存失败。文件快照与运行事件以历史版本核对，避免旧消息与新空闲状态混在一起。
+前端 `app.js` 只提交用户意图和展示结果，使用 textContent 安全渲染历史文字，不能提交替换工具代码或直接调用 runner。
+Web 入口仅绑定 127.0.0.1，关闭调试器和自动重载；检查 Host/Origin 和 CSRF，不开放跨域或项目目录。
+开发服务仅用于本机使用，未提供公网部署或用户认证功能。
 
 ## 启动 Agent
 
@@ -34,7 +149,7 @@ export MODEL_NAME='your-model'
 read -rsp 'API Key: ' MODEL_API_KEY
 export MODEL_API_KEY
 
-.venv/bin/python main.py
+.venv/bin/python -m backend.main
 ```
 
 配置项：
@@ -55,7 +170,7 @@ export MODEL_API_KEY
 | `MODEL_TOKENS_PER_CHAR` | Unicode/JSON 字符的 token 粗估系数 | `2` |
 | `MODEL_SUMMARY_MAX_TOKENS` | 无工具摘要请求的输出上限 | `min(1024, 主请求输出上限)` |
 
-启用窗口控制后，需要自行在项目 `.env` 或进程环境中补充窗口和输出上限；缺失时启动会报告具体变量。
+启用窗口控制后，需要自行在 `backend/.env` 或进程环境中补充窗口和输出上限；缺失时启动会报告具体变量。
 窗口填实际服务规格，输出上限填自己允许的生成预算。程序不会替你修改 `.env` 或猜测模型能力。
 token 数量支持整数及 K/M 单位（大小写均可）：`272K = 272000`，`128K = 128000`，`1M = 1000000`；
 预留比例填写 `0.2`，不填写 `20%`。配置无效时会指出具体变量或没有输入空间的预算。
@@ -69,12 +184,12 @@ export MODEL_AUTH_PREFIX=''
 
 其他 token 也可以放在 `MODEL_API_KEY` 中，通过上述两个配置控制发送方式。
 多个认证字段可用 `MODEL_EXTRA_HEADERS` 提供；与认证字段重名时，以单独配置的认证值为准。
-程序自动加载与 `llm.py` 同目录的 `.env`，不依赖当前工作目录；已存在的进程环境变量优先，
+程序通过 `backend.paths.ENV_FILE` 自动加载 `backend/.env`，不依赖当前工作目录；已存在的进程环境变量优先，
 不会被 `.env` 覆盖。不要将包含真实密钥的 `.env` 提交到版本库。
 服务若有不同的消息或工具调用协议，应修改 `llm.py` 的适配逻辑。
 
 每段模型生成代码都会展示并询问确认，只有输入 `y` 才执行。
-运行配置直接在 `main.py` 的 `main()` 中修改：`root` 是文件工具根目录，
+运行配置直接在 `backend/main.py` 的 `main()` 中修改：`root` 是文件工具根目录，
 默认为项目目录；`max_rounds = 10` 控制本次执行最多的模型决策轮数，每轮请求最多尝试 3 次，
 `code_timeout = 5.0` 控制每次代码执行超时。不再解析命令行参数。
 达到上限或 API 重试耗尽时，任务保留检查点，终端可选择恢复、明确结束或返回列表；配置错误保存检查点后退出并报告。拒绝代码执行会取消该任务。不会自动重放已执行代码。
@@ -117,7 +232,7 @@ export MODEL_AUTH_PREFIX=''
 
 恢复的模型上下文为“保存的系统消息 → 当前分支的有效累计摘要（如有）→ 未压缩的历史和当前任务”，不会把其他分支拼到系统提示词中。
 使用 `/fork` 可从当前分支中的旧节点创建新分支；需要从其他分支的消息开始时，先通过 `/branches` 切换到该分支。
-当前只实现终端交互，未引入 GUI、新框架或新依赖。
+任务提交与人工审批可使用 CLI 或 Web；两个入口共用项目写入锁，使用同一套领域逻辑和 JSON。
 
 ### 从旧消息创建分支
 
@@ -137,7 +252,8 @@ export MODEL_AUTH_PREFIX=''
 
 ## 执行循环
 
-`main.py` 组装工具、接口、压缩及窗口管理 → `cli.py` 选择对话、分支和接收任务 → `agent.py` 维护检查点 → `ContextManager` 准备上下文 → `llm.py` 请求模型。
+`main.py` 通过 `agent_factory.py` 组装工具、接口和上下文管理 → `cli.py` 接收终端任务 → `agent.py` 维护检查点 → `ContextManager` 准备上下文 → `llm.py` 请求模型。
+Web 则由 HTTP → AgentService → 独立 Worker 调用相同 Agent，工具审批通过 Pipe 回到原调用栈。
 模型调用 `run_code` 时，宿主先确认代码，再调用 `runner.py`，将状态、输出和异常
 记录为带 `tool_call_id` 的工具消息，连同历史发送到下一轮。
 模型返回没有工具调用的普通回答时结束，最终回答应包含原代码问题、修改和验证依据。
@@ -260,18 +376,19 @@ JSON 原子替换只覆盖历史快照，不能使“修改项目文件或外部
 ## 最小用法
 
 ```python
-from tools import ToolRegistry, register_file_tools
-from prompts import build_system_message
-from runner import run_code
+from backend.tools import ToolRegistry, register_file_tools
+from backend.prompts import build_system_message
+from backend.runner import run_code
+from backend.paths import PROJECT_ROOT
 
 registry = ToolRegistry()
-register_file_tools(registry, ".")
+register_file_tools(registry, PROJECT_ROOT)
 system_message = build_system_message(registry)
 # 接入模型后，将 system_message 和历史消息一同发送给模型。
 print(system_message.content)
 
 # 当前手工模拟模型生成的代码；真实接入后也应先展示代码供人工检查。
-code = 'text = read_file("models.py")\nprint(text[:500])'
+code = 'text = read_file("backend/models.py")\nprint(text[:500])'
 print(code)
 # 仅在人工确认这段具体代码之后，由宿主程序设置 approved=True。
 result = run_code(code, registry, approved=True)
@@ -315,7 +432,7 @@ print(result.status, result.output, result.error)
 它不发送 API 请求、不改变上下文，也不判断窗口阈值或触发压缩。
 
 ```python
-from token_stats import estimate_request_tokens, parse_usage
+from backend.token_stats import estimate_request_tokens, parse_usage
 
 # 使用实际准备发给 API 的消息字典列表，不传 History、TaskRun 或整个请求体。
 messages = [{"role": "user", "content": "检查代码"}]
@@ -344,7 +461,7 @@ API usage 与估算分别保存，不相加成窗口占用，不把历次 total_
 
 ## 独立上下文压缩模块
 
-`compaction.py` 的 `CompactionManager` 只生成和选择摘要，以及构造模型可见的临时上下文。
+`compaction_manager.py` 的 `CompactionManager` 只生成和选择摘要，以及构造模型可见的临时上下文。
 它不修改原消息、parent_id、children_ids、root_id、current_leaf_id 或 TaskRun，也不创建摘要 Session。
 摘要保存到同一个对话 JSON 的 compactions 集合，原始树和旧摘要继续保留。
 
@@ -397,11 +514,11 @@ S2 构建上下文时独立使用，不再同时发送 S1；S1 留在文件中�
 下面假设调用方已明确取得 history、current_task_id、模型客户端 client 和 store。预算仅为示例，需要与实际模型窗口及输出预留匹配：
 
 ```python
-from compaction import CompactionManager
+from backend.compaction_manager import CompactionManager
 
 manager = CompactionManager(
-    summarizer=client,       # 提供 summarize(messages, max_output_tokens=...) -> str
-    store=store,             # 提供 save(history)
+    summarizer=client,  # 提供 summarize(messages, max_output_tokens=...) -> str
+    store=store,  # 提供 save(history)
     max_input_tokens=20_000,
     max_summary_tokens=1_000,
 )
@@ -491,7 +608,7 @@ run_code 中静态出现的内部工具名称不等于它实际执行过，摘�
 ## 验证
 
 ```bash
-.venv/bin/python -m unittest -v test_tools test_agent test_memory
+.venv/bin/python -m unittest -v tests.test_tools tests.test_agent tests.test_memory
 ```
 
 测试使用临时目录、搜索/MCP 替身和模拟 HTTP 响应，不修改项目源文件，不访问外部服务。

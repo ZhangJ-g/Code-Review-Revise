@@ -1,14 +1,32 @@
 {
     "version": "0.2.0",
     "configurations": [
-            {
-        "name": "Debug Current Test",
-        "type": "debugpy",
-        "request": "launch",
-        "python": "${workspaceFolder}/.venv/bin/python",
-        "program": "${file}",
-        "cwd": "${workspaceFolder}",
-        "console": "integratedTerminal"
+        {
+            "name": "Debug 代码检查助手（项目虚拟环境）",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "module": "backend.main",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug Web 工作台",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "module": "backend.web_main",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Debug Current Test",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "module": "tests.${fileBasenameNoExtension}",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
         }
     ]
 }
