@@ -9,20 +9,29 @@ from flask import Flask, abort, jsonify, request, send_from_directory, session
 from werkzeug.exceptions import HTTPException
 
 from ..context_manager import ContextConfig
-from ..memory_store import JsonMemoryStore
+from ..memory_store import JsonMemoryStore, PersistentMemoryStore
+from ..persistent_memory_management import PersistentMemoryManager
 from ..paths import ENV_FILE, FRONTEND_DIR
 from .errors import ServiceError
 from .serializers import conversation_dict, conversation_snapshot, fingerprint
+from .memories import register_memory_routes
 
 
 def create_app(*, store: JsonMemoryStore | None = None, context_config: ContextConfig | None = None,
-               service=None) -> Flask:
+               service=None, memory_manager=None) -> Flask:
     app = Flask(__name__, static_folder=None)
     app.config.update(TRUSTED_HOSTS=["127.0.0.1", "localhost","192.168.1.216" ,"[::1]"], MAX_CONTENT_LENGTH=256 * 1024,
                       SECRET_KEY=secrets.token_bytes(32), SESSION_COOKIE_NAME="code_agent_session",
                       SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Strict")
     app.json.ensure_ascii = False
     memory = store if store is not None else JsonMemoryStore()
+    # 路由和父进程服务共用一个记忆管理器；没有传入时，在应用启动时创建。
+    memories = memory_manager if memory_manager is not None else getattr(service, "memory_manager", None)
+    if memories is None:
+        memories = PersistentMemoryManager(PersistentMemoryStore(memory.directory))
+    app.extensions["persistent_memory"] = memories
+    if service is not None:
+        service.memory_manager = memories
     config_error = None
     if context_config is None:
         load_dotenv(ENV_FILE, override=False)
@@ -41,11 +50,11 @@ def create_app(*, store: JsonMemoryStore | None = None, context_config: ContextC
                         and request.headers.get("Sec-Fetch-Dest") == "document")
         if request.headers.get("Sec-Fetch-Site") not in {None, "none", "same-origin"} and not opening_page:
             abort(403)
-        if request.method not in {"GET", "HEAD", "OPTIONS", "POST"}:
+        if request.method not in {"GET", "HEAD", "OPTIONS", "POST", "PUT", "DELETE"}:
             abort(405)
         if request.method == "OPTIONS":
             return "", 204
-        if request.method == "POST":
+        if request.method in {"POST", "PUT", "DELETE"}:
             if service is None:
                 abort(405)
             csrf = session.get("csrf_token")
@@ -81,7 +90,7 @@ def create_app(*, store: JsonMemoryStore | None = None, context_config: ContextC
 
     @app.get("/assets/<name>")
     def asset(name):
-        if name not in {"app.js", "styles.css", "icons.svg", "favicon.svg"}:
+        if name not in {"app.js", "memory-page.js", "styles.css", "icons.svg", "favicon.svg"}:
             abort(404)
         return send_from_directory(FRONTEND_DIR, name)
 
@@ -89,10 +98,12 @@ def create_app(*, store: JsonMemoryStore | None = None, context_config: ContextC
     def info():
         runtime = service.snapshot() if service is not None else {"execution_connected": False, "busy": False}
         connected = runtime["execution_connected"]
+        active_memory = memories.get_active_memory()
         return api_json({"mode": "interactive" if connected else "read_only", "execution_connected": connected,
                          "capabilities": {"browse_history": True, "browse_branches": True,
                                           "submit_task": connected, "approve_tool": connected,
                                           "create_conversation": connected}, "runtime": runtime,
+                         "active_memory_id": active_memory.id if active_memory else None,
                          "context_configured": context_config is not None,
                          "config_error": config_error})
 
@@ -120,8 +131,11 @@ def create_app(*, store: JsonMemoryStore | None = None, context_config: ContextC
         except (ValueError, OSError):
             return jsonify(error={"code": "unreadable_history", "message": "对话无法读取或校验失败，请在终端核对原文件。"}), 422
         leaf_id = request.args.get("leaf_id")
+        # 本次页面响应固定用这一份记忆，让名称、版本和 Token 估算保持一致。
+        memory_snapshot = memories.get_snapshot()
         try:
-            data = conversation_snapshot(history, leaf_id=leaf_id, config=context_config, config_error=config_error)
+            data = conversation_snapshot(history, leaf_id=leaf_id, config=context_config, config_error=config_error,
+                                         memory_snapshot=memory_snapshot)
         except ValueError:
             return jsonify(error={"code": "invalid_branch", "message": "分支不存在或不是叶节点，请刷新列表。"}), 400
         if service is not None:
@@ -135,7 +149,8 @@ def create_app(*, store: JsonMemoryStore | None = None, context_config: ContextC
                     break
                 try:
                     history = memory.load(conversation_id)
-                    data = conversation_snapshot(history, leaf_id=leaf_id, config=context_config, config_error=config_error)
+                    data = conversation_snapshot(history, leaf_id=leaf_id, config=context_config, config_error=config_error,
+                                                 memory_snapshot=memory_snapshot)
                 except FileNotFoundError:
                     abort(404)
                 except ValueError:
@@ -246,4 +261,5 @@ def create_app(*, store: JsonMemoryStore | None = None, context_config: ContextC
         # 不把历史正文、环境变量或异常堆栈交给浏览器。
         return jsonify(error={"code": "internal_error", "message": "读取失败，请稍后刷新或在终端检查历史。"}), 500
 
+    register_memory_routes(app, memories, service)
     return app

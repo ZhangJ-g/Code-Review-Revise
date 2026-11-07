@@ -11,9 +11,10 @@ from .history import History
 from .context_manager import ContextManager, PreparedContext, RequestReport, prepare_messages
 from .model_api import ErrorKind, ModelError, ModelReply, RetryPolicy
 from .memory_store import JsonMemoryStore
+from .persistent_memory_management import MemoryProvider
 from .message_utils import pending_tool_calls
-from .models import Message, Role, Session, TaskRun, ToolCall, new_id
-from .prompts import build_system_message
+from .models import MemorySnapshot, Message, Role, Session, TaskRun, ToolCall, new_id
+from .prompts import build_system_message, with_long_term_memory
 from .runner import RunResult, run_code
 from .tools import ToolRegistry
 
@@ -41,6 +42,7 @@ class Agent:
         store: JsonMemoryStore | None = None,
         context_manager: ContextManager | None = None,
         retry_policy: RetryPolicy | None = None,
+        memory_manager: MemoryProvider | None = None,
     ) -> None:
         if max_rounds <= 0 or not math.isfinite(code_timeout) or code_timeout <= 0:
             raise ValueError("最大轮数和代码超时必须大于零，超时必须有限")
@@ -54,10 +56,24 @@ class Agent:
         self._task: TaskRun | None = None
         self._checkpoint_failed = False
         self.context_manager = context_manager
+        self.memory_manager = memory_manager if memory_manager is not None else getattr(context_manager, "memory_manager", None)
         self.retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self.request_reports: list[RequestReport] = []
         self.last_round_context: PreparedContext | None = None
         self.last_round_error: str | None = None
+
+    def set_memory_manager(self, manager: MemoryProvider) -> None:
+        """把记忆读取对象交给 Agent 和上下文管理器。
+
+        CLI 直接读取管理器内存；Web 通过代理（代为发送请求的对象）向父进程取记忆。
+        """
+        self.memory_manager = manager
+        if self.context_manager is not None:
+            self.context_manager.memory_manager = manager
+
+    def _memory_snapshot(self) -> MemorySnapshot:
+        """取得本次要用的记忆状态；未配置管理器时返回未应用记忆的状态。"""
+        return self.memory_manager.get_snapshot() if self.memory_manager is not None else MemorySnapshot()
 
     @property
     def history(self) -> list[Session]:
@@ -296,16 +312,23 @@ class Agent:
 
     def _prepare_context(
         self, *, force_compact: bool = False, previous_fingerprint: str | None = None,
+        memory_snapshot: MemorySnapshot | None = None,
     ) -> PreparedContext:
         #为当前这次大模型请求准备上下文，
         if self.context_manager is None:
             # 保留底层 Agent 的旧用法；main 始终注入带窗口预算的管理器。
-            return prepare_messages([entry.message for entry in self.history],
+            snapshot = memory_snapshot if memory_snapshot is not None else self._memory_snapshot()
+            messages = [entry.message for entry in self.history]
+            if self.memory_manager is not None:
+                # 即使没有窗口管理器，也能在临时列表末尾追加当前记忆。
+                messages = with_long_term_memory(messages, snapshot.memory)
+            return prepare_messages(messages,
                                     getattr(self.client, "tool_definitions", []),
-                                    max_output_tokens=getattr(self.client, "max_output_tokens", None))
+                                    max_output_tokens=getattr(self.client, "max_output_tokens", None),
+                                    memory_snapshot=snapshot)
         try:
             return self.context_manager.prepare(self.history_tree, self._task.id, force_compact=force_compact,
-                                                previous_fingerprint=previous_fingerprint)
+                                                previous_fingerprint=previous_fingerprint, memory_snapshot=memory_snapshot)
         except OSError:
             self._checkpoint_failed = True
             raise  # 摘要保存失败同样要求重新加载，不能补写未提交内存。
@@ -326,14 +349,22 @@ class Agent:
 
     def _request_reply(self) -> Message:
         # 预检/摘要有自己的错误边界，不能被当作主请求错误再次整轮重试。
-        prepared = self._prepare_context()
+        snapshot = self._memory_snapshot()
+        prepared = self._prepare_context(memory_snapshot=snapshot)
         context_recovered = False
         for attempt in range(1, self.retry_policy.max_attempts + 1):
+            # 发请求前再看一次当前记忆；生成摘要或等待重试期间，用户可能切换过记忆。
+            # 若状态变了就重新组装和检查 Token；没变则继续用已经检查好的消息。
+            latest = self._memory_snapshot()
+            if latest != snapshot:
+                snapshot = latest
+                prepared = self._prepare_context(memory_snapshot=snapshot)
             self._task.rounds += 1  # 记录实际请求尝试；一次决策可能有多次请求。
             self._checkpoint(phase="waiting_model")
             # 为本次实际请求创建观测记录，记录上下文指纹、摘要 ID 和 Token 估算。
             report = RequestReport(new_id(), prepared.fingerprint, prepared.compaction_id,
-                                   prepared.estimate.estimated_input_tokens, prepared.input_budget)
+                                   prepared.estimate.estimated_input_tokens, prepared.input_budget,
+                                   memory_revision=prepared.memory_revision, memory_id=prepared.memory_id)
             self.request_reports.append(report)
             try:
                 # 优先使用支持返回 Token usage 等信息的接口，否则使用普通请求接口。
@@ -361,7 +392,8 @@ class Agent:
 
                     # 强制触发压缩，并通过 previous_fingerprint 防止上下文没有变化时重复发送。
                     # 压缩完成后重新构建 PreparedContext，再进入下一轮模型请求。
-                    prepared = self._prepare_context(force_compact=True, previous_fingerprint=prepared.fingerprint)
+                    prepared = self._prepare_context(force_compact=True, previous_fingerprint=prepared.fingerprint,
+                                                     memory_snapshot=snapshot)
                     continue
                 delay = self.retry_policy.delay(attempt, error)
                 if delay is None:

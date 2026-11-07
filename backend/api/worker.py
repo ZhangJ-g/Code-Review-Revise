@@ -15,6 +15,7 @@ from ..history import History
 from ..memory_store import JsonMemoryStore
 from ..message_utils import pending_tool_calls
 from ..model_api import ModelError
+from ..models import MemorySnapshot
 from ..prompts import build_system_message
 from ..runtime_lock import ProjectBusyError, ProjectLock
 from .errors import ServiceError
@@ -124,6 +125,28 @@ class _Worker:
         self.event(name, {"conversation_id": self.command["data"].get("conversation_id"),
                           "task_id": self.task_id, **data})
 
+    def get_snapshot(self) -> MemorySnapshot:
+        """向父进程请求当前记忆状态，并等待对应回复。
+
+        Worker 不保存另一份记忆目录。通信失败就报错，不能当作用户关闭了记忆。
+        """
+        # 通信编号：确认收到的回复属于这次请求。
+        request_id = secrets.token_hex(12)
+        if not self.send({"type": "memory_snapshot_request", "id": request_id}):
+            raise RuntimeError("长期记忆服务连接已中断")
+        if not self.connection.poll(10):
+            raise RuntimeError("长期记忆快照获取超时，未发送模型请求")
+        try:
+            response = self.connection.recv()
+        except (EOFError, OSError):
+            raise RuntimeError("长期记忆服务连接已中断") from None
+        if response.get("method") == "shutdown":
+            raise KeyboardInterrupt
+        if (response.get("type") != "memory_snapshot" or response.get("id") != request_id
+                or not isinstance(response.get("snapshot"), MemorySnapshot)):
+            raise RuntimeError("长期记忆快照响应无效，未发送模型请求")
+        return response["snapshot"]
+
     def approve(self, code):
         if self.disconnected:
             raise KeyboardInterrupt
@@ -187,6 +210,8 @@ class _Worker:
 
         if method in {"submit", "resume"}:
             self.agent = self.factory(self.approve, store=self.store, root=self.root, observer=self.observe)
+            # 让 Agent 通过上面的 get_snapshot() 向父进程取记忆。
+            self.agent.set_memory_manager(self)
         else:
             self.agent = Agent(_NoModel(), create_registry(self.root), self.approve, store=self.store)
 

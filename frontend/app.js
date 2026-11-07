@@ -155,7 +155,7 @@ const appearance = (() => {
     }
   });
   applyTheme();
-  return { init, togglePanel, focusSearch, resizeComposer,
+  return { init, togglePanel, focusSearch, resizeComposer, closeDrawers,
     closeSidebar: () => {
       if (elements?.sidebar.classList.contains("open")) {
         closeDrawers();
@@ -170,6 +170,9 @@ const state = { conversations: [], snapshot: null, info: null, notices: [], requ
   mutating: false, submitting: false, fork: null, dialog: null, drafts: new Map(), approvalId: null, csrf: null };
 const responseCache = new Map();
 const pendingMutations = new Map();
+let memoryPage = null;
+let memoryPageLoading = null;
+let memoryView = false;
 const number = new Intl.NumberFormat("zh-CN");
 const dateTime = new Intl.DateTimeFormat("zh-CN", {
   timeZone: "Asia/Shanghai", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
@@ -237,7 +240,7 @@ async function fetchResponse(path, options) {
   } catch (cause) {
     if (!(cause instanceof TypeError) && !["TimeoutError", "AbortError"].includes(cause.name)) throw cause;
     // 只有实际写请求的网络失败才意味着执行结果未知；页面代码的 TypeError 不能冒充超时。
-    const writing = options.method === "POST";
+    const writing = ["POST", "PUT", "DELETE"].includes(options.method);
     const error = new Error(writing
       ? "操作结果尚未确认，请刷新检查点；再次提交会沿用原请求 ID。"
       : "无法读取服务，请检查网络连接和 Web 服务是否仍在运行。");
@@ -264,15 +267,18 @@ async function api(path) {
   return payload;
 }
 
-async function mutate(path, body) {
+async function mutate(path, body, method = "POST") {
   const semantic = { ...body };
   delete semantic.expected_revision;
-  const key = path + JSON.stringify(semantic);
+  // 版本号可能随刷新变化；判断是不是同一操作时，先忽略版本号。
+  delete semantic.expected_memory_revision;
+  const key = method + path + JSON.stringify(semantic);
+  // 若上次请求结果未知，重试仍使用原 ID 和原参数，避免重复执行。
   const payload = pendingMutations.get(key) || { ...body, client_request_id: createRequestId() };
   pendingMutations.set(key, payload);
   if (!state.csrf) state.csrf = (await api("/api/session")).csrf_token;
   async function send() {
-    const response = await fetchResponse(path, { method: "POST", credentials: "same-origin", cache: "no-store",
+    const response = await fetchResponse(path, { method, credentials: "same-origin", cache: "no-store",
       signal: AbortSignal.timeout(15000),
       headers: { "Content-Type": "application/json", "X-CSRF-Token": state.csrf }, body: JSON.stringify(payload) });
     return { response, result: await response.json().catch(() => null) };
@@ -678,6 +684,7 @@ function renderMetrics(metrics) {
   if (metrics.latest_request) {
     $("token-note").textContent += ` 最近请求输入估算 ${number.format(metrics.latest_request.estimated_input_tokens)} token。`;
   }
+  $("token-note").textContent += metrics.memory_name ? ` 包含长期记忆「${metrics.memory_name}」。` : " 未应用长期记忆。";
 }
 
 function renderCompactions(snapshot) {
@@ -846,6 +853,9 @@ function updateLocation(id, leafId, replace = false) {
 }
 
 async function selectConversation(id, leafId = null, { replace = false, preserveScroll = false, fallback = true } = {}) {
+  if (memoryView && !preserveScroll) {
+    if (!await showChat()) return false;
+  }
   const request = ++state.request;
   $("messages").setAttribute("aria-busy", "true");
   if (!preserveScroll) $("messages").classList.add("loading-view");
@@ -895,6 +905,10 @@ async function refresh(manual = false) {
     renderNotices();
     renderConversations();
     applyControls();
+    if (memoryView) {
+      await memoryPage?.refresh();
+      return;
+    }
     // 轮询期间用户已选择其他对话时，不用旧选择覆盖新的导航。
     if (state.request !== navigationAtStart) return;
     const url = new URL(location.href);
@@ -927,9 +941,11 @@ async function refresh(manual = false) {
 
 function bindWorkspaceEvents() {
   appearance.init();
+  $("memory-button").addEventListener("click", () => showMemories());
   $("conversation-search").addEventListener("input", renderConversations);
   $("refresh-button").addEventListener("click", () => refresh(true));
   $("new-button").addEventListener("click", () => perform(async () => {
+    if (memoryView && !await showChat()) return;
     const result = await mutate("/api/conversations", {});
     state.fork = null;
     await afterWrite(result.conversation_id);
@@ -986,17 +1002,70 @@ function bindWorkspaceEvents() {
       appearance.focusSearch();
     }
   });
-  window.addEventListener("popstate", () => {
+  window.addEventListener("popstate", async () => {
     const url = new URL(location.href);
+    if (url.searchParams.get("view") === "memories") { await showMemories(false); return; }
+    if (memoryView && !await showChat(false)) {
+      const retained = new URL(location.href);
+      retained.searchParams.set("view", "memories");
+      history.replaceState({}, "", retained);
+      return;
+    }
     const id = url.searchParams.get("conversation");
     if (id) selectConversation(id, url.searchParams.get("branch"), { replace: true });
   });
+  if (new URL(location.href).searchParams.get("view") === "memories") showMemories(false);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
   async function poll() {
     if (!document.hidden) await refresh();
     setTimeout(poll, runtime().busy ? 1000 : 5000);
   }
   poll();
+}
+
+async function showMemories(push = true) {
+  // 第一次打开才加载页面模块；聊天区域只是隐藏，原草稿和会话仍保留。
+  try {
+    if (!memoryPageLoading) memoryPageLoading = import("/assets/memory-page.js").then(({ createMemoryPage }) => {
+      memoryPage = createMemoryPage({ api, mutate, toast, leave: showChat, onChange: () => refresh() });
+      return memoryPage;
+    }).catch((error) => { memoryPageLoading = null; throw error; });
+    await memoryPageLoading;
+    const opening = !memoryView;
+    memoryView = true;
+    appearance.closeDrawers();
+    $("chat-workspace").hidden = true;
+    $("memory-page").hidden = false;
+    $("inspector-toggle").hidden = true;
+    $("memory-button").setAttribute("aria-current", "page");
+    document.title = "记忆管理 · 代码检查助手";
+    $("workspace-page-label").textContent = "记忆管理";
+    if (push && opening) {
+      const url = new URL(location.href);
+      url.searchParams.set("view", "memories");
+      history.pushState({}, "", url);
+    }
+    await memoryPage.refresh();
+  } catch (error) { toast(error.message); }
+}
+
+async function showChat(push = true) {
+  // 先确认是否放弃记忆草稿，再显示原聊天区域并刷新后端状态。
+  if (memoryView && memoryPage && !memoryPage.canLeave()) return false;
+  memoryView = false;
+  $("memory-page").hidden = true;
+  $("chat-workspace").hidden = false;
+  $("inspector-toggle").hidden = false;
+  $("memory-button").removeAttribute("aria-current");
+  document.title = `${state.snapshot?.conversation.title || "会话工作台"} · 代码检查助手`;
+  $("workspace-page-label").textContent = "会话工作台";
+  if (push) {
+    const url = new URL(location.href);
+    url.searchParams.delete("view");
+    history.pushState({}, "", url);
+  }
+  await refresh();
+  return true;
 }
 
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", bindWorkspaceEvents, { once: true });

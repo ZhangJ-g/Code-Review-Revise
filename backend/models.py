@@ -106,3 +106,25 @@ class Compaction:
     id: str = field(default_factory=new_id)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     base_compaction_id: str | None = None
+
+
+@dataclass(frozen=True)
+class LongTermMemory:
+    """一条用户保存的长期背景资料；所有会话共享，不算历史消息或任务。"""
+
+    name: str
+    content: str
+    id: str = field(default_factory=new_id)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass(frozen=True)
+class MemorySnapshot:
+    """快照：构建本次上下文时取得的一份固定记忆状态。
+
+    revision 是目录版本号；memory 是当前记忆，None 表示未应用任何记忆。
+    """
+
+    revision: int = 0
+    memory: LongTermMemory | None = None

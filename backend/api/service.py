@@ -17,6 +17,7 @@ from pathlib import Path
 
 from ..agent_factory import create_agent
 from ..paths import MEMORY_DIR, PROJECT_ROOT
+from ..models import MemorySnapshot
 from .errors import ServiceError
 from .worker import worker_main
 
@@ -29,8 +30,9 @@ class _Receipt:
 
 
 class AgentService:
-    def __init__(self, *, directory=MEMORY_DIR, root=PROJECT_ROOT, factory=create_agent):
+    def __init__(self, *, directory=MEMORY_DIR, root=PROJECT_ROOT, factory=create_agent, memory_manager=None):
         self.directory, self.root, self.factory = Path(directory).resolve(), Path(root).resolve(), factory
+        self.memory_manager = memory_manager
         self._mutex = threading.RLock()
         self._ready_event = threading.Event()
         self._process = self._connection = self._reader = None
@@ -86,7 +88,12 @@ class AgentService:
                 message = self._connection.recv()
                 with self._mutex:
                     self._version += 1
-                    if message["type"] == "ready":
+                    if message["type"] == "memory_snapshot_request":
+                        # 父进程（Flask 所在进程）保存记忆；Worker 请求时直接返回内存状态。
+                        # 这里不读 JSON，也不用给 Worker 增加后台线程。
+                        snapshot = self.memory_manager.get_snapshot() if self.memory_manager is not None else MemorySnapshot()
+                        self._connection.send({"type": "memory_snapshot", "id": message["id"], "snapshot": snapshot})
+                    elif message["type"] == "ready":
                         self._ready, self._message = message["ready"], message["message"]
                         self._ready_event.set()
                     elif message["type"] == "reply":

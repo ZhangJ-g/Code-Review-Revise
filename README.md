@@ -21,6 +21,7 @@ Web 和 CLI 复用同一个 Agent 执行循环与历史存储；项目写入锁�
 │   ├── runtime_lock.py        # 项目写入互斥
 │   ├── agent.py / cli.py
 │   ├── models.py / history.py / memory_store.py
+│   ├── persistent_memory_management.py  # 全局持久记忆缓存与管理
 │   ├── llm.py / model_api.py / prompts.py
 │   ├── runner.py / message_utils.py / token_stats.py
 │   ├── context_manager.py / compaction.py
@@ -133,10 +134,65 @@ CLI 继续使用 `.venv/bin/python -m backend.main`。Web 新增 Flask 作为 HT
 `service.py` 管理后台进程、请求去重和运行观测；`worker.py` 串行调用现有 Agent，并将用户决定交给审批回调。
 保存成功后才发布观测事件，通知失败不伪装成保存失败。文件快照与运行事件以历史版本核对，避免旧消息与新空闲状态混在一起。
 前端 `app.js` 只提交用户意图和展示结果，使用 textContent 安全渲染历史文字，不能提交替换工具代码或直接调用 runner。
-Web 入口仅绑定 127.0.0.1，关闭调试器和自动重载；检查 Host/Origin 和 CSRF，不开放跨域或项目目录。
+Web 入口关闭调试器和自动重载；检查 Host/Origin 和 CSRF，不开放跨域或项目目录。
 开发服务仅用于本机使用，未提供公网部署或用户认证功能。
 
-## 启动 Agent
+## 全局持久化记忆
+
+启动方式保持不变：运行 `backend/web_main.py`，或在根目录执行 `.venv/bin/python -m backend.web_main`，
+浏览器打开 `http://127.0.0.1:8888`。左侧“新建对话”和搜索框之间增加“记忆管理”，点击后切换到独立页面，
+可返回原聊天；会话、分支和未发送的聊天草稿保持。
+
+- 点击“新建记忆”创建一条未应用的空记忆；选中列表项只进入编辑，不切换当前应用。
+- 名称和正文支持编辑，正文为 Markdown 文本；“保存”同步后端。“应用”仅应用已保存内容。
+- 当前应用在列表和页面顶部标识；“取消当前应用”停止后续注入。删除当前记忆也会清空应用状态，不自动选择另一条。
+- 所有会话共享一条当前记忆。任务执行或等待审批时仍可编辑和切换，已生成的工具代码及审批凭证不变。
+- 保存和应用从下一次模型请求的准备阶段生效；已发出的请求不会撤回，恢复任务也使用当前应用记忆。
+- 有未保存修改时，切换条目或返回聊天会确认是否放弃；保存冲突保留草稿，可重新加载后核对。
+
+`PersistentMemoryManager` 在入口创建，启动时通过 `PersistentMemoryStore` 加载
+`memory/long_term/memories.json`，文件包含 `version`、`revision`、`active_memory_id` 和 `memories`。
+首次没有文件时视为空目录，第一次修改时创建；该运行数据目录已加入 Git 忽略。
+名称最多 120 字符，正文最多 32000 字符，最多 100 条，目录文件最大 2 MB。
+
+管理器以 RLock 串行修改，保存到同目录临时文件并 fsync 后原子替换，保存成功才发布新缓存。
+记忆文件单独使用写锁与文件签名校验，检测到其他实例或外部程序修改时拒绝覆盖。修订号防止过期编辑覆盖，
+client_request_id 在当前管理器生命周期内去重；去重结果不跨进程重启保存。
+第一版仅支持单个可写 Web 进程，不提供多 WSGI worker 的缓存同步或运行中手动编辑 JSON 的热加载。
+
+Web 父进程持有管理器，Worker 通过现有 Pipe 同步获取内存快照；正常模型请求不重读 JSON，
+Worker 保持单线程。记忆 CRUD 不进入 Agent 写命令队列，不会因模型执行或等待审批而阻塞。
+CLI 启动时加载同一目录并使用本地管理器，不逐任务询问。
+
+模型输入在历史视图构造完成后追加一条临时 USER 消息，content 为
+`{"context_type":"long_term_memory","name":"记忆名称","content":"Markdown 正文"}`。
+固定系统规则说明它是用户背景资料、不是新任务，不单独回答，也不能覆盖系统规则或工具权限。
+规则附加到临时系统消息副本，所以旧对话也生效；原始系统根节点不修改。
+记忆不创建 Session 或 TaskRun，不保存到对话 JSON，不交给历史摘要器。
+模型此前已经把记忆内容写入回答时，这些实际历史仍保留，取消应用不会自动抹除。
+
+ContextManager 在注入后估算完整 Token 和 fingerprint，一次预检和压缩前后固定同一快照；
+每次实际请求尝试前检查更新，普通重试也能使用新记忆。超限时只压缩安全旧历史，
+记忆和当前任务仍放不下就暂停并报告。页面预览估算包括当前记忆，最近请求的 usage 与记忆 ID/修订号属于实际请求观测。
+记忆始终在临时列表末尾，每轮重新构造且只追加一份；这种位置可能减少多轮前缀缓存复用。
+
+| 接口 | 输入 |
+| --- | --- |
+| `GET /api/memories` | 返回全部条目、active_memory_id、revision 和 writable |
+| `POST /api/memories` | name、content |
+| `PUT /api/memories/<id>` | name、content |
+| `DELETE /api/memories/<id>` | 无业务字段 |
+| `POST /api/memories/active` | memory_id；null 表示取消应用 |
+
+所有写接口还要求 `client_request_id`、`expected_memory_revision`、JSON 正文与 `X-CSRF-Token`，
+PUT/DELETE 同样校验 Host、Origin 和 CSRF。记忆修订冲突返回 409；只读 Web 不允许修改。
+前端不会直接读写 JSON。修改记忆只影响上下文预览修订，不改变会话 history_revision，因此不会使原工具审批失效。
+
+验证：`.venv/bin/python -B -m unittest tests.test_persistent_memory -v`。
+覆盖磁盘恢复、当前条目选择、历史不变、无重复注入、Token/指纹、压缩和强制恢复、重试时切换、
+原子保存失败、并发冲突、接口校验，以及真实 Worker/审批/本地 runner 的多轮闭环；模型使用替身。
+
+## 启动 Agent（模型配置）
 
 接口地址可填完整的 POST 地址；若只填域名或以 `/v1` 结尾的基础地址，程序会自动补成
 `/v1/chat/completions`。其他自定义路径保持原样。当前协议为 Chat Completions

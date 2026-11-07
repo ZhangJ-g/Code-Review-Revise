@@ -14,14 +14,17 @@ def main() -> int:
         from .api.app import create_app
         from .api.service import AgentService
         from .api.errors import ServiceError
+        from .persistent_memory_management import PersistentMemoryManager
     except ModuleNotFoundError as error:
         if error.name not in {"flask", "werkzeug"}:
             raise
         print("请先用项目虚拟环境安装 requirements.txt 中的 Web 依赖。")
         return 2
     try:
-        with AgentService() as service:
-            app = create_app(service=service)
+        # 入口创建一次，供 Flask 路由和父进程服务共用；Worker 通过通信取记忆。
+        memories = PersistentMemoryManager()
+        with AgentService(memory_manager=memories) as service:
+            app = create_app(service=service, memory_manager=memories)
             print("代码检查助手 · Agent 工作台：http://127.0.0.1:8888")
             if not service.snapshot()["execution_connected"]:
                 print(service.snapshot()["message"] or "执行服务未连接，当前仅可浏览。")
@@ -31,8 +34,11 @@ def main() -> int:
     except ServiceError as error:
         print(f"Web 执行服务启动失败：{error}")
         return 2
+    except ValueError as error:
+        print(f"长期记忆配置无效：{error}")
+        return 2
     except OSError:
-        print("Web 启动失败，请检查本机 8888 端口是否已被占用。")
+        print("Web 启动失败，请检查 8888 端口占用及长期记忆文件读取权限。")
         return 2
     return 0
 

@@ -43,6 +43,7 @@ class _ObservedSummarizer:
 def create_agent(
     approve: Callable[[str], bool], *, store: JsonMemoryStore | None = None,
     root=PROJECT_ROOT, observer=None, max_rounds: int = 10, code_timeout: float = 5.0,
+    memory_manager=None,
 ) -> Agent:
     config = ModelConfig.from_env()
     context_config = ContextConfig.from_env()
@@ -54,6 +55,8 @@ def create_agent(
         _ObservedSummarizer(client, observer), memory, max_input_tokens=context_config.summary_input_budget,
         max_summary_tokens=context_config.summary_output_limit, tokens_per_char=context_config.tokens_per_char,
     )
-    context = ContextManager(context_config, compactor, client.tool_definitions)
+    # 把记忆读取对象交给上下文管理器，由它在历史末尾追加当前记忆。
+    context = ContextManager(context_config, compactor, client.tool_definitions, memory_manager=memory_manager)
     return Agent(client, create_registry(root), approve, store=memory, context_manager=context,
-                 retry_policy=retry_policy, max_rounds=max_rounds, code_timeout=code_timeout)
+                 retry_policy=retry_policy, max_rounds=max_rounds, code_timeout=code_timeout,
+                 memory_manager=memory_manager)

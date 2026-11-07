@@ -14,6 +14,7 @@ from .cli import run_cli
 from .model_api import ModelError
 from .paths import PROJECT_ROOT
 from .runtime_lock import ProjectBusyError, ProjectLock
+from .persistent_memory_management import PersistentMemoryManager
 
 
 def confirm_code(code: str) -> bool:
@@ -31,7 +32,10 @@ def main() -> int:
     code_timeout = 5.0
     try:
         with ProjectLock(owner="CLI"):
-            agent = create_agent(confirm_code, root=root, max_rounds=max_rounds, code_timeout=code_timeout)
+            # 启动时加载记忆文件，后续模型请求直接使用这个对象的内存数据。
+            persistent_manager= PersistentMemoryManager()
+            agent = create_agent(confirm_code, root=root, max_rounds=max_rounds, code_timeout=code_timeout,
+                                 memory_manager=persistent_manager)
             print(f"文件工具根目录：{root}")
             return run_cli(agent)
     except ProjectBusyError as error:

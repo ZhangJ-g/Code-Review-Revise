@@ -13,6 +13,7 @@ from ..message_utils import message_to_dict
 from ..models import Role
 from ..memory_store import history_to_dict
 from ..token_stats import estimate_request_tokens
+from ..prompts import with_long_term_memory
 
 
 class _ReadOnlyCapabilities:
@@ -42,12 +43,17 @@ def history_revision(history: History) -> str:
     return fingerprint(history_to_dict(history))
 
 
-def _metrics(history: History, task, config: ContextConfig | None, config_error: str | None) -> dict:
+def _metrics(history: History, task, config: ContextConfig | None, config_error: str | None, memory_snapshot=None) -> dict:
     tools = [RUN_CODE_TOOL]
     ratio = config.tokens_per_char if config else 2.0
     raw = estimate_request_tokens([message_to_dict(entry.message) for entry in history.path()],
                                   tools, tokens_per_char=ratio).estimated_input_tokens
     estimated, compaction_id, source = raw, None, "raw_history"
+    if memory_snapshot is not None:
+        # 页面估算也包含长期记忆；raw 仍保留原始历史的估算，便于区分。
+        messages = with_long_term_memory([entry.message for entry in history.path()], memory_snapshot.memory)
+        estimated = estimate_request_tokens([message_to_dict(message) for message in messages],
+                                            tools, tokens_per_char=ratio).estimated_input_tokens
     warning = config_error
     if config is not None and task is not None:
         readonly = _ReadOnlyCapabilities()
@@ -57,7 +63,7 @@ def _metrics(history: History, task, config: ContextConfig | None, config_error:
         )
         try:
             # inspect 只重建视图；不能用会触发摘要请求的 prepare。
-            view = ContextManager(config, compactor, tools).inspect(history, task.id)
+            view = ContextManager(config, compactor, tools).inspect(history, task.id, memory_snapshot=memory_snapshot)
             estimated = view.estimate.estimated_input_tokens
             compaction_id, source = view.compaction_id, "context_preview"
         except CompactionError:
@@ -71,12 +77,15 @@ def _metrics(history: History, task, config: ContextConfig | None, config_error:
         "over_budget": estimated > budget if budget is not None else None,
         "usage": None, "warning": warning,
         "usage_note": "历史文件未保存 API usage，无法恢复实测用量。",
+        "memory_id": memory_snapshot.memory.id if memory_snapshot and memory_snapshot.memory else None,
+        "memory_name": memory_snapshot.memory.name if memory_snapshot and memory_snapshot.memory else None,
+        "memory_revision": memory_snapshot.revision if memory_snapshot else 0,
     }
 
 
 def conversation_snapshot(
     history: History, *, leaf_id: str | None = None,
-    config: ContextConfig | None = None, config_error: str | None = None,
+    config: ContextConfig | None = None, config_error: str | None = None, memory_snapshot=None,
 ) -> dict:
     """可浏览其他叶节点，但不移动原 History 指针，不写回默认分支。"""
     selected = leaf_id if leaf_id is not None else history.conversation.current_leaf_id
@@ -134,7 +143,7 @@ def conversation_snapshot(
     view_history = History(replace(history.conversation, current_leaf_id=selected),
                            list(history.nodes.values()), list(history.tasks.values()),
                            list(history.compactions.values()))
-    metrics = _metrics(view_history, current_task, config, config_error)
+    metrics = _metrics(view_history, current_task, config, config_error, memory_snapshot)
     compactions = [{"id": record.id, "through_node_id": record.through_node_id,
                     "summary": record.summary, "created_at": record.created_at.isoformat(),
                     "base_compaction_id": record.base_compaction_id,

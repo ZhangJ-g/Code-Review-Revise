@@ -18,7 +18,9 @@ from .compaction_manager import CompactionError
 from .history import History
 from .message_utils import message_to_dict
 from .model_api import ErrorKind, ModelError
-from .models import Compaction, Message
+from .models import Compaction, MemorySnapshot, Message
+from .persistent_memory_management import MemoryProvider
+from .prompts import with_long_term_memory
 from .token_stats import TokenEstimate, TokenUsage, estimate_request_tokens, estimate_text_tokens
 
 
@@ -123,6 +125,9 @@ class PreparedContext:
     input_budget: int | None
     compaction_id: str | None
     fingerprint: str
+    # 记录这份上下文使用的记忆版本和 ID；不作为额外字段发给模型。
+    memory_revision: int = 0
+    memory_id: str | None = None
 
 
 @dataclass
@@ -138,19 +143,26 @@ class RequestReport:
     usage_error: str | None = None
     response_id: str | None = None
     error_kind: ErrorKind | None = None
+    # 方便排查：这次实际请求用了哪个版本、哪条记忆。
+    memory_revision: int = 0
+    memory_id: str | None = None
 
 
 def prepare_messages(
     messages: list[Message], tools: list[dict], *, tokens_per_char: float = 2.0,
     input_budget: int | None = None, compaction_id: str | None = None,
     max_output_tokens: int | None = None,
+    memory_snapshot: MemorySnapshot | None = None,
 ) -> PreparedContext:
+    """估算最终消息的 Token，并计算指纹（用来判断请求内容是否变化）。"""
     wire = [message_to_dict(message) for message in messages]
     estimate = estimate_request_tokens(wire, tools, tokens_per_char=tokens_per_char)
     serialized = json.dumps({"messages": wire, "tools": tools, "max_output_tokens": max_output_tokens},
                             ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    snapshot = memory_snapshot or MemorySnapshot()
     return PreparedContext(deepcopy(messages), estimate, input_budget, compaction_id,
-                           hashlib.sha256(serialized.encode("utf-8")).hexdigest())
+                           hashlib.sha256(serialized.encode("utf-8")).hexdigest(), snapshot.revision,
+                           snapshot.memory.id if snapshot.memory else None)
 
 
 class ContextManager:
@@ -173,7 +185,8 @@ class ContextManager:
     摘要安全边界、累计摘要及保存由后者负责，模型请求重试与工具执行由 Agent 负责。
     """
 
-    def __init__(self, config: ContextConfig, compactor: ContextCompactor, tools: list[dict]) -> None:
+    def __init__(self, config: ContextConfig, compactor: ContextCompactor, tools: list[dict],
+                 memory_manager: MemoryProvider | None = None) -> None:
         """
         Protocol 不是让 ContextManager 去调用 Protocol 里面的函数，而是把 ContextManager 对外部依赖的最低能力要求描述出来。
         compactor: ContextCompactor这里声明是为了表达出最少都需要当前函数的接口、能力、具体什么能力不重要
@@ -181,27 +194,44 @@ class ContextManager:
         self.config = config
         self.compactor = compactor
         self.tools = deepcopy(tools)
+        self.memory_manager = memory_manager
 
-    def  inspect(self, history: History, task_id: str) -> PreparedContext:
-        """统计当前视图；不请求摘要、不执行压缩，适用于循环结束后的观测。"""
+    def get_memory_snapshot(self) -> MemorySnapshot:
+        """取当前记忆状态；读取对象可能是本地管理器，也可能是 Web 进程代理。"""
+        return self.memory_manager.get_snapshot() if self.memory_manager is not None else MemorySnapshot()
+
+    def inspect(self, history: History, task_id: str, *, memory_snapshot: MemorySnapshot | None = None) -> PreparedContext:
+        """选已有摘要、组装历史、追加当前记忆，再统计 Token。
+
+        不生成新摘要，也不保存历史，轮末统计和页面预览都可以调用。
+        """
         record = self.compactor.select(history, task_id)#选择压缩的摘要
+        snapshot = memory_snapshot if memory_snapshot is not None else self.get_memory_snapshot()
+        # 压缩器只管历史；历史组好后再加记忆，二者一起计入 Token 和指纹。
+        messages = with_long_term_memory(self.compactor.build_context(history, task_id), snapshot.memory)
         return prepare_messages(
-            self.compactor.build_context(history, task_id), self.tools,
+            messages, self.tools,
             tokens_per_char=self.config.tokens_per_char, input_budget=self.config.input_budget,
             compaction_id=record.id if record else None, max_output_tokens=self.config.max_output_tokens,
+            memory_snapshot=snapshot,
         )
 
     def prepare(#对上下文是否满足做判断
         self, history: History, task_id: str, *, force_compact: bool = False,
         previous_fingerprint: str | None = None,
+        memory_snapshot: MemorySnapshot | None = None,
     ) -> PreparedContext:
-        prepared = self.inspect(history, task_id)
+        # 一次预检（发送前检查）始终用同一份记忆。
+        # 这样比较压缩前后 Token 时，不会因为用户换了记忆而算错压缩效果。
+        snapshot = memory_snapshot if memory_snapshot is not None else self.get_memory_snapshot()
+        #!!这里获取上下文视图
+        prepared = self.inspect(history, task_id, memory_snapshot=snapshot)
         if force_compact or prepared.estimate.estimated_input_tokens > self.config.input_budget:
             try:
                 self.compactor.compact(history, task_id)
             except CompactionError as error:
                 raise ModelError(f"无法安全压缩：{error}", kind=ErrorKind.CONTEXT_LIMIT) from None
-            after = self.inspect(history, task_id)
+            after = self.inspect(history, task_id, memory_snapshot=snapshot)
             if (after.fingerprint == prepared.fingerprint
                     or after.estimate.estimated_input_tokens >= prepared.estimate.estimated_input_tokens):
                 raise ModelError("没有进一步缩小的安全空间；保留当前任务并暂停，请检查窗口配置或工具输出大小",

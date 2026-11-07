@@ -22,6 +22,7 @@
         <button class="new-button" id="new-button" disabled title="新建本地对话">
           <svg class="icon"><use href="/assets/icons.svg#plus"></use></svg>新建对话<span>NEW</span>
         </button>
+        <button class="subtle-button memory-nav" id="memory-button" type="button">记忆管理</button>
         <label class="search-box">
           <svg class="icon"><use href="/assets/icons.svg#search"></use></svg>
           <input id="conversation-search" type="search" placeholder="搜索对话…" aria-label="搜索对话" autocomplete="off">
@@ -44,7 +45,7 @@
         <div class="breadcrumb">
           <button class="icon-button mobile-menu" id="menu-button" aria-label="显示或隐藏对话列表" aria-controls="sidebar" aria-expanded="true" title="显示或隐藏对话列表"><svg class="icon"><use href="/assets/icons.svg#panel-left"></use></svg></button>
           <svg class="icon breadcrumb-icon"><use href="/assets/icons.svg#chat"></use></svg>
-          <span>工作空间</span><span class="breadcrumb-slash">/</span><strong>会话工作台</strong>
+          <span>工作空间</span><span class="breadcrumb-slash">/</span><strong id="workspace-page-label">会话工作台</strong>
           <span class="edition-tag" id="edition-tag">正在连接</span>
         </div>
         <div class="topbar-actions">
@@ -56,7 +57,24 @@
       </header>
 
       <div class="notice" id="notice" role="alert" hidden></div>
-      <div class="content-grid">
+      <section id="memory-page" class="memory-page" aria-label="全局记忆管理" hidden>
+        <header class="memory-heading"><div><div class="eyebrow">PERSISTENT MEMORY</div><h1>记忆管理</h1><p id="memory-active-status">正在读取共享记忆…</p></div><button id="memory-back" class="subtle-button" type="button">返回聊天</button></header>
+        <p class="memory-help">所有会话共享当前应用的记忆。选择列表项只编辑；点击应用后，从下一次模型请求生效。内容支持 Markdown，不会写入历史树。</p>
+        <div id="memory-error" class="memory-error" role="alert" hidden></div>
+        <div class="memory-columns">
+          <aside class="memory-catalog" aria-label="记忆列表"><div class="memory-list-actions"><button id="memory-new" class="primary-button" type="button" disabled>新建记忆</button><button id="memory-reload" class="subtle-button" type="button">重新加载</button></div><nav id="memory-list" aria-label="已保存的记忆"></nav></aside>
+          <div class="memory-editor">
+            <p id="memory-empty" class="muted">新建或选择一条记忆开始编辑。</p>
+            <form id="memory-form" hidden>
+              <label for="memory-name">记忆名称</label><input id="memory-name" type="text" maxlength="120" required autocomplete="off">
+              <label for="memory-content">记忆内容 <span class="muted">Markdown</span></label><textarea id="memory-content" maxlength="32000" spellcheck="false" placeholder="# 项目约定&#10;在这里填写你希望 Agent 参考的背景资料。"></textarea>
+              <p id="memory-editor-state" class="tiny-note" aria-live="polite"></p>
+              <div class="memory-editor-actions"><button id="memory-save" class="primary-button" type="submit">保存</button><button id="memory-apply" class="subtle-button" type="button">应用</button><button id="memory-delete" class="subtle-button danger-text" type="button">删除</button><button id="memory-clear" class="subtle-button" type="button">取消当前应用</button></div>
+            </form>
+          </div>
+        </div>
+      </section>
+      <div class="content-grid" id="chat-workspace">
         <main class="conversation-pane" id="conversation-pane">
           <header class="conversation-header">
             <div class="conversation-heading">

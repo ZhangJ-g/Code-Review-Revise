@@ -1,6 +1,7 @@
 """一段对话一个 JSON 文件，保存元数据与全部历史分支。"""
 
 import json
+import fcntl
 import os
 import re
 import tempfile
@@ -9,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .history import History, excerpt, require_timestamp
-from .models import Compaction, Conversation, Message, Role, Session, TaskRun, ToolCall
+from .models import Compaction, Conversation, LongTermMemory, Message, Role, Session, TaskRun, ToolCall
 from .paths import MEMORY_DIR
 
 
@@ -126,6 +127,7 @@ def history_from_dict(data: dict) -> History:
             first_user = min(users, key=lambda node: (node.created_at, node.id)) if users else None
             history.conversation.title = excerpt(first_user.message.content) if first_user else ""
         return history
+
     except (KeyError, TypeError, AttributeError):
         raise ValueError("历史 JSON 缺少必要字段或字段类型错误") from None
 
@@ -207,3 +209,128 @@ class JsonMemoryStore:
         if history.conversation.id != conversation_id:
             raise ValueError("文件名与对话 ID 不一致")
         return history
+
+
+class MemoryConflict(ValueError):
+    """记忆已被其他请求修改，需要重新加载，避免覆盖别人的修改。"""
+
+
+def validate_memory(memory: LongTermMemory) -> None:
+    """检查一条记忆的 ID、名称、正文长度和时间是否有效。"""
+    if not isinstance(memory.id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", memory.id):
+        raise ValueError("记忆 ID 无效")
+    if not isinstance(memory.name, str) or not memory.name.strip() or len(memory.name) > 120:
+        raise ValueError("记忆名称必须是 1～120 个字符")
+    if not isinstance(memory.content, str) or len(memory.content) > 32000:
+        raise ValueError("记忆内容必须是最多 32000 个字符的 Markdown 文本")
+    require_timestamp(memory.created_at)
+    require_timestamp(memory.updated_at)
+    if memory.updated_at < memory.created_at:
+        raise ValueError("记忆更新时间不能早于创建时间")
+
+
+def memory_catalog_to_dict(revision: int, active_id: str | None, memories) -> dict:
+    """检查整个记忆目录，并转成 JSON 能保存的字典；时间转成字符串。"""
+    if type(revision) is not int or revision < 0:
+        raise ValueError("记忆修订号无效")
+    rows, ids = [], set()
+    for memory in memories:
+        validate_memory(memory)
+        if memory.id in ids:
+            raise ValueError("记忆 ID 重复")
+        ids.add(memory.id)
+        row = asdict(memory)
+        for key in ("created_at", "updated_at"):
+            row[key] = row[key].isoformat()
+        rows.append(row)
+    if len(rows) > 100:
+        raise ValueError("最多保存 100 条记忆")
+    if active_id is not None and (not isinstance(active_id, str) or active_id not in ids):
+        raise ValueError("当前应用的记忆不存在")
+    return {"version": 1, "revision": revision, "active_memory_id": active_id, "memories": rows}
+
+
+class PersistentMemoryStore:
+    """负责读写长期记忆 JSON 文件，不负责选择当前应用的记忆。
+
+    管理器启动时调用 load()，用户修改时调用 save()；模型请求使用内存数据。
+    """
+
+    def __init__(self, directory: str | Path = MEMORY_DIR) -> None:
+        self.path = Path(directory) / "long_term" / "memories.json"
+        self._signature = None
+
+    def _current_signature(self):
+        """文件标记：文件编号、最后修改时间和大小，用来发现外部修改。"""
+        try:
+            stat = self.path.stat()
+            return stat.st_ino, stat.st_mtime_ns, stat.st_size
+        except FileNotFoundError:
+            return None
+
+    def load(self) -> tuple[int, str | None, tuple[LongTermMemory, ...]]:
+        """读取并检查 JSON，返回目录版本、当前记忆 ID 和全部条目。"""
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                stat = os.fstat(handle.fileno())
+                signature = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                if stat.st_size > 2_000_000:
+                    raise ValueError("记忆文件超过 2 MB 上限")
+                text = handle.read(2_000_001)
+        except FileNotFoundError:
+            self._signature = None
+            return 0, None, ()
+        try:
+            if len(text) > 2_000_000:
+                raise ValueError("记忆文件超过 2 MB 上限")
+            data = json.loads(text, object_pairs_hook=_reject_duplicate_keys,
+                              parse_constant=_reject_nonfinite_number)
+            if (not isinstance(data, dict) or type(data["version"]) is not int
+                    or data["version"] != 1 or not isinstance(data["memories"], list)):
+                raise ValueError("记忆文件格式或版本无效")
+            records = []
+            for raw in data["memories"]:
+                if not isinstance(raw, dict) or set(raw) != {"id", "name", "content", "created_at", "updated_at"}:
+                    raise ValueError("记忆字段缺失或包含不支持的字段")
+                row = dict(raw)
+                for key in ("created_at", "updated_at"):
+                    row[key] = _time_from_json(row[key])
+                records.append(LongTermMemory(**row))
+            revision = data.get("revision", 0)
+            memory_catalog_to_dict(revision, data["active_memory_id"], records)
+        except (KeyError, TypeError, json.JSONDecodeError, UnicodeError):
+            raise ValueError("长期记忆 JSON 缺少字段或格式无效，未覆盖文件") from None
+        if self._current_signature() != signature:
+            raise MemoryConflict("记忆文件在加载期间发生变化，请重新启动服务")
+        self._signature = signature
+        return revision, data["active_memory_id"], tuple(records)
+
+    def save(self, revision: int, active_id: str | None, memories) -> None:
+        """先写好临时文件，再整体替换旧文件，避免只保存半份 JSON。"""
+        data = memory_catalog_to_dict(revision, active_id, memories)
+        text = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+        if len(text.encode("utf-8")) > 2_000_000:
+            raise ValueError("记忆文件超过 2 MB 上限")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # 文件锁：同一时间只让一个进程保存；文件标记用于发现其他程序的修改。
+        with self.path.with_suffix(".lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if self._current_signature() != self._signature:
+                raise MemoryConflict("记忆文件已被其他实例或外部程序修改，请重启后重新加载")
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent,
+                                                 prefix=".memories-", suffix=".tmp", delete=False) as handle:
+                    temp_path = Path(handle.name)
+                    handle.write(text)
+                    handle.flush()
+                    # fsync：要求系统把临时文件的内容写入磁盘，再替换旧文件。
+                    os.fsync(handle.fileno())
+                    stat = os.fstat(handle.fileno())
+                    signature = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+                os.replace(temp_path, self.path)
+                # 替换成功就表示文件已保存；直接记下标记，不再额外查询文件。
+                self._signature = signature
+            finally:
+                if temp_path is not None and temp_path.exists():
+                    temp_path.unlink()

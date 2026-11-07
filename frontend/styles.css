@@ -1862,3 +1862,41 @@ meter.over::-moz-meter-bar { background:var(--color-warning); }
   .approval-panel { max-height:40dvh; }
   .composer-area { padding-block:8px; }
 }
+
+/* 记忆页沿用全站配色，内容编辑框显示 Markdown 原文。 */
+.memory-nav { width:100%; justify-content:flex-start; margin-block:6px; }
+.memory-nav[aria-current="page"] { background:var(--color-accent-soft); color:var(--color-accent); }
+.memory-page { flex:1; min-height:0; padding:26px; overflow:auto; }
+.memory-heading { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }
+.memory-heading p,.memory-help { color:var(--color-text-secondary); font-size:12px; line-height:1.7; }
+.memory-help { margin:12px 0 22px; max-width:850px; }
+.memory-columns { display:grid; grid-template-columns:230px minmax(0,1fr); gap:28px; }
+.memory-catalog { min-width:0; border-right:1px solid var(--color-border); padding-right:18px; }
+.memory-list-actions { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; }
+#memory-list { display:flex; flex-direction:column; gap:4px; color:var(--color-text-secondary); font-size:12px; }
+.memory-list-item { border:0; background:transparent; color:var(--color-text-primary); text-align:left; padding:10px; border-radius:6px; min-width:0; cursor:pointer; }
+.memory-list-item:hover { background:var(--color-surface-secondary); }
+.memory-list-item[aria-current="true"] { background:var(--color-accent-soft); }
+.memory-list-item strong { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
+.memory-list-item small { display:block; margin-top:5px; color:var(--color-text-secondary); }
+.memory-list-item[aria-current="true"] small { color:var(--color-accent); }
+.memory-editor { min-width:0; max-width:1000px; }
+#memory-form { display:flex; flex-direction:column; gap:12px; }
+#memory-form label { font-size:12px; font-weight:550; }
+#memory-name,#memory-content { width:100%; box-sizing:border-box; border:1px solid var(--color-border-strong); border-radius:7px; background:var(--color-surface); color:var(--color-text-primary); padding:12px; font:inherit; }
+#memory-content { min-height:320px; height:45dvh; resize:vertical; line-height:1.7; font-family:ui-monospace,monospace; font-size:13px; }
+#memory-name:focus,#memory-content:focus { outline:2px solid var(--color-accent); outline-offset:2px; }
+.memory-editor-actions { display:flex; flex-wrap:wrap; gap:9px; }
+.memory-error { margin:12px 0; padding:10px 12px; color:var(--color-danger); background:var(--color-danger-soft); border-radius:6px; font-size:13px; overflow-wrap:anywhere; }
+.danger-text { color:var(--color-danger); }
+.memory-page button:disabled { cursor:default; opacity:.5; }
+@media(max-width:900px) {
+  .memory-page { padding:18px; }
+  .memory-columns { grid-template-columns:minmax(0,1fr); gap:22px; }
+  .memory-catalog { border-right:0; border-bottom:1px solid var(--color-border); padding:0 0 15px; }
+  #memory-list { max-height:200px; overflow:auto; }
+}
+@media(max-width:480px) {
+  .memory-heading { flex-wrap:wrap; }
+  #memory-content { min-height:260px; }
+}
